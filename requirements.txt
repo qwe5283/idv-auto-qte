@@ -1,0 +1,6 @@
+opencv-python
+numpy
+mss
+pydirectinput
+pywin32
+psutil
