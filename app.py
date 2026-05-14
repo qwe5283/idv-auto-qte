@@ -83,6 +83,7 @@ class Config:
 
     # 预览
     PREVIEW_VIDEO_HIT_TIME_SEC: float = 3 # 视频分析模式下，停留预览命中结果展示的时长（秒）
+    PREVIEW_WINDOW_TOP_MOST: bool = False # 预览窗口是否置顶
     
     # 比例调整和最大屏幕分辨率
     TARGET_ASPECT_RATIO: float = 16 / 9
@@ -541,7 +542,7 @@ class App:
         self.detector = QTEDetector(w, h, self.cfg)
         self.tracker = QTETracker(self.cfg)
 
-    def _process_and_render(self, frame: np.ndarray, frame_elapsed: float = 0, cap_elapsed: float = 0) -> bool:
+    def _process_and_render(self, frame: np.ndarray, frame_elapsed: float = 0, cap_elapsed: float = 0, topmost: bool = False) -> bool:
         """统一处理一帧图像：检测 -> 追踪 -> 渲染"""
         if self.detector is None or self.tracker is None:
             return False
@@ -573,7 +574,7 @@ class App:
         
         # 缩放以更好显示
         window_name = "Identity V QTE Auto-Handler"
-        if True:
+        if topmost:
             cv2.namedWindow(window_name)
             cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
         show_frame = cv2.resize(vis_frame, (960, 540))
@@ -607,7 +608,7 @@ class App:
                     break
 
                 # 检测与追踪
-                is_hit = self._process_and_render(frame, elapsed)
+                is_hit = self._process_and_render(frame, elapsed, 0, self.cfg.PREVIEW_WINDOW_TOP_MOST)
 
                 if is_hit:
                     print(">>> 触发按键: Space <<<")
@@ -696,7 +697,7 @@ class App:
                 cap_elapsed = time.perf_counter() - start_time
                 
                 # 检测与追踪
-                is_hit = self._process_and_render(frame, elapsed, cap_elapsed)
+                is_hit = self._process_and_render(frame, elapsed, cap_elapsed, self.cfg.PREVIEW_WINDOW_TOP_MOST)
                 
                 if is_hit:
                     self.input_ctrl.press_space()
