@@ -166,7 +166,7 @@ class WindowManager:
         win32gui.EnumWindows(callback, hwnds)
         return hwnds[0] if hwnds else None
 
-    def wait_for_focus(self, process_name: str) -> Tuple[Optional[int], str]:
+    def wait_for_focus(self, process_name: str) -> Tuple[int, str]:
         """同步阻塞，等待游戏客户端或 MuMu 模拟器成为焦点窗口，返回(顶层窗口句柄, 客户端类型)"""
         print(f"[*] 等待进程 [{process_name}] 启动并获取焦点...")
         while True:
@@ -415,6 +415,9 @@ class QTETracker:
             self.status_msg = "Yellow Missing/Unstable"
             return False
 
+        if self.locked_yellow_span is None:
+            return False
+
         # 基于到达时间的预判
         # target_angle = sum(self.locked_yellow_span) / 2
         target_angle = self.locked_yellow_span[0]
@@ -511,7 +514,7 @@ class App:
 
     def _handle_aspect_ratio_check(self, w: int, h: int):
         """处理比例检查与用户交互"""
-        if w == 0 or h == 0: return w, h
+        if w == 0 or h == 0 or self.hwnd is None: return w, h
         if abs((w / h) - self.cfg.TARGET_ASPECT_RATIO) < 0.15: return w, h
         
         print(f"[!] 检测到窗口比例 {w/h:.2f} 非 16:9 ({w}x{h})")
@@ -540,6 +543,9 @@ class App:
 
     def _process_and_render(self, frame: np.ndarray, frame_elapsed: float = 0, cap_elapsed: float = 0) -> bool:
         """统一处理一帧图像：检测 -> 追踪 -> 渲染"""
+        if self.detector is None or self.tracker is None:
+            return False
+        
         # 检测与追踪
         red_angle, yellow_span = self.detector.process_frame(frame)
         is_hit = self.tracker.update_and_check(red_angle, yellow_span)
@@ -597,7 +603,7 @@ class App:
                 
                 # 读取视频帧
                 ret, frame = cap.read()
-                if not ret: 
+                if not ret or self.tracker is None: 
                     break
 
                 # 检测与追踪
@@ -607,7 +613,7 @@ class App:
                     print(">>> 触发按键: Space <<<")
                     # 延长冷却时间并暂停视频预览命中结果
                     self.tracker.last_trigger_time += self.cfg.PREVIEW_VIDEO_HIT_TIME_SEC
-                    if cv2.waitKey(self.cfg.PREVIEW_VIDEO_HIT_TIME_SEC * 1000) & 0xFF == ord('q'): 
+                    if cv2.waitKey(int(self.cfg.PREVIEW_VIDEO_HIT_TIME_SEC * 1000)) & 0xFF == ord('q'): 
                         break
                 elif cv2.waitKey(1) & 0xFF == ord('q'):
                     break
