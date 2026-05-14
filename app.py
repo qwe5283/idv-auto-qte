@@ -69,10 +69,12 @@ class Config:
     END_ANGLE: int = 340
     
     # 追踪器参数
-    SYSTEM_DELAY_MS: float = 50.0         # 延迟补偿毫秒（结合截图处理延迟换算），提前触发
+    SYSTEM_DELAY_MS: float = 20.0          # 延迟补偿毫秒（结合截图处理延迟换算），提前触发
     COOLDOWN_SEC: float = 1.5             # QTE击打触发后的冷却时间（秒）
     HISTORY_LENGTH: int = 4
-    MIN_ANGULAR_SPEED_DPS: float = 30.0   # 最小角速度阈值（度/秒）
+    MIN_ANGULAR_SPEED_DPS: float = 30.0   # 红色指针的最小角速度阈值（度/秒），转动过慢将被忽略
+    # （新出现的红色指针应位于圆弧左侧，角度小于此阈值才视为合法QTE指针，排除场景红色物体误判）
+    NEW_RED_MAX_ANGLE: float = 215.0      # 红色指针首次出现时的最大允许角度（度）
     # （第五人格的完美校准（角度）黄色范围通常为5度左右）
     MIN_YELLOW_SPAN_DEG: float = 3.0      # 允许的最小QTE黄色区域范围（角），将过滤掉小于此角度的黄色区域
     # （锁存黄色区域并延迟消失，防止红色指针盖住黄色区域影响HSV范围导致无法识别黄色区域）
@@ -353,7 +355,8 @@ class QTEDetector:
             end_x = int(self.arc_center[0] + self.radius * math.cos(rad))
             end_y = int(self.arc_center[1] + self.radius * math.sin(rad))
             cv2.circle(vis_frame, (end_x, end_y), 4, (255, 0, 255), -1)
-            cv2.line(vis_frame, self.arc_center, (end_x, end_y), (0, 0, 255), 2)
+            if status_msg != "Red Not On Left Side":
+                cv2.line(vis_frame, self.arc_center, (end_x, end_y), (0, 0, 255), 2)
             
         # 绘制掩膜轮廓
         contours, _ = cv2.findContours(self.arc_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -407,6 +410,12 @@ class QTETracker:
             self.red_angle_history.clear()
             return False
             
+        # 新红色指针出现时（历史为空），验证其是否在圆弧左侧
+        if len(self.red_angle_history) == 0 and red_front_angle >= self.cfg.NEW_RED_MAX_ANGLE:
+            self.status_msg = "Red Not On Left Side"
+            return False
+
+        # 检测红色指针是否停止转动
         self.red_angle_history.append((red_front_angle, current_time))
         if not self._check_red_moving_right():
             self.status_msg = "Red Not Moving/Too Slow"
@@ -608,7 +617,7 @@ class App:
                     break
 
                 # 检测与追踪
-                is_hit = self._process_and_render(frame, elapsed, 0, self.cfg.PREVIEW_WINDOW_TOP_MOST)
+                is_hit = self._process_and_render(frame, elapsed, 0, False)
 
                 if is_hit:
                     print(">>> 触发按键: Space <<<")
@@ -672,9 +681,6 @@ class App:
                 # 动态获取当前帧的客户区尺寸
                 left, top, right, bottom = self.win_mgr.get_client_rect(self.hwnd)
                 w, h = right - left, bottom - top
-                
-                # DPI 安全校验：若宽高与 mss 实际截取尺寸不符则发出警告
-                # (当进程 DPI 感知生效后，此处 w/h 应为物理像素，与 mss 一致
 
                 if w <= 0 or h <= 0:
                     time.sleep(0.2)
