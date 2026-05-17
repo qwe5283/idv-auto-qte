@@ -69,9 +69,9 @@ class Config:
     END_ANGLE: int = 340
     
     # 追踪器参数
-    SYSTEM_DELAY_MS: float = 20.0          # 延迟补偿毫秒（结合截图处理延迟换算），提前触发
+    SYSTEM_DELAY_MS: float = 50.0         # 精准触发延迟阈值，当计算的剩余QTE命中时间小于此值时，将直接阻塞至触发时刻，防止跳帧错过QTE
     COOLDOWN_SEC: float = 1.5             # QTE击打触发后的冷却时间（秒）
-    HISTORY_LENGTH: int = 4
+    HISTORY_LENGTH: int = 8
     MIN_ANGULAR_SPEED_DPS: float = 30.0   # 红色指针的最小角速度阈值（度/秒），转动过慢将被忽略
     # （新出现的红色指针应位于圆弧左侧，角度小于此阈值才视为合法QTE指针，排除场景红色物体误判）
     NEW_RED_MAX_ANGLE: float = 215.0      # 红色指针首次出现时的最大允许角度（度）
@@ -85,7 +85,7 @@ class Config:
 
     # 预览
     PREVIEW_VIDEO_HIT_TIME_SEC: float = 3 # 视频分析模式下，停留预览命中结果展示的时长（秒）
-    PREVIEW_WINDOW_TOP_MOST: bool = False # 预览窗口是否置顶
+    PREVIEW_WINDOW_TOP_MOST: bool = True  # 预览窗口是否置顶
     
     # 比例调整和最大屏幕分辨率
     TARGET_ASPECT_RATIO: float = 16 / 9
@@ -391,8 +391,17 @@ class QTETracker:
         self.locked_yellow_span = None
         self.status_msg = "Waiting"
 
-    def update_and_check(self, red_front_angle: Optional[float], yellow_span: Optional[Tuple[float, float]]) -> bool:
-        """返回是否应该触发按键"""
+    def update_and_check(self, red_front_angle: Optional[float], yellow_span: Optional[Tuple[float, float]], processing_elapsed: float = 0.0) -> bool:
+        """更新状态并执行指针判断。
+
+        Args:
+            red_front_angle: 当前帧的红色指针指向的任意角角度。
+            yellow_span: 黄色目标区域(起始, 截止)的任意角角度范围。
+            processing_elapsed: 当前帧已消耗的处理时间(秒)。
+
+        Returns:
+            bool: 是否应该触发QTE按键击打
+        """
         current_time = time.perf_counter()
 
         if self.triggered:
@@ -427,38 +436,74 @@ class QTETracker:
 
         if self.locked_yellow_span is None:
             return False
-
-        # 基于到达时间的预判
-        # target_angle = sum(self.locked_yellow_span) / 2
-        target_angle = self.locked_yellow_span[0]
-        # 延迟补偿 (self.angular_speed 已经是 度/秒)
-        delay_compensation_angle = self.angular_speed * (self.cfg.SYSTEM_DELAY_MS / 1000.0)
-        # 拿到延迟补偿后当前指针所指角度
-        current_projected_angle = red_front_angle + delay_compensation_angle
         
-        if current_projected_angle >= target_angle: # 判定指针已经到达目标
-            self.triggered = True
-            self.last_trigger_time = current_time
-            self.status_msg = ">>> HIT! SPACE <<<"
-            self.red_angle_history.clear()
-            self.locked_yellow_span = None
+        # 时间驱动触发
+        target_angle = self.locked_yellow_span[0]
+        delta_angle = target_angle - red_front_angle
+
+        if delta_angle <= 0: # 指针已经进入校准区域，立刻触发补救
+            self._execute_trigger()
+            return True
+        # 基于中值滤波后的速度，计算到达目标所需的时间（秒）
+        time_to_target = delta_angle / self.angular_speed
+        # 转换系统延迟阈值配置为单位秒
+        system_delay_threshold = self.cfg.SYSTEM_DELAY_MS / 1000.0
+        # 当剩余到达时间小于系统延迟阈值时，进入精准触发程序，防止脚本跳帧
+        if time_to_target <= system_delay_threshold:
+            # 计算需要精准睡眠的时间
+            wait_time = time_to_target - processing_elapsed
+            if wait_time > 0:
+                # 精准睡眠，将按键时机精度从帧间隔(如40ms)提升到睡眠精度(1~2ms)
+                print(f"sleep for {wait_time * 1000:.2f}ms")
+                time.sleep(wait_time)
+            self._execute_trigger()
             return True
             
         self.status_msg = f"Approaching... R:{red_front_angle:.1f} T:{target_angle:.1f}"
         return False
+    
+    def _execute_trigger(self):
+        """执行触发状态的重置与标记"""
+        self.triggered = True
+        self.last_trigger_time = time.perf_counter()
+        self.status_msg = ">>> HIT! SPACE <<<"
+        self.red_angle_history.clear()
+        self.locked_yellow_span = None
 
     def _check_red_moving_right(self) -> bool:
-        """检测红色指针是否正在向右顺时针旋转"""
+        """检测红色指针是否正在向右顺时针旋转，即角速度是否大于设置值。
+
+        使用中值滤波计算角速度，剔除采样混叠产生的异常速度。
+
+        Returns:
+            红色指针是否正在向右顺时针旋转
+        """
         if len(self.red_angle_history) < self.cfg.HISTORY_LENGTH:
             return False # 记录红色指针的队列未满，直接返回
-        first_angle, first_time = self.red_angle_history[0]
-        last_angle, last_time = self.red_angle_history[-1]
+        
+        # 1. 计算相邻两帧之间的瞬时速度
+        instantaneous_speeds = []
+        for i in range(1, len(self.red_angle_history)):
+            prev_angle, prev_time = self.red_angle_history[i-1]
+            curr_angle, curr_time = self.red_angle_history[i]
+            dt = curr_time - prev_time
+            if dt < 1e-6: continue # 防除零
+            da = curr_angle - prev_angle
+            instantaneous_speeds.append(da / dt)
 
-        delta_time = last_time - first_time
-        if delta_time < 1e-6: return False  # 防除零
+        if not instantaneous_speeds: return False
 
-        delta_angle = last_angle - first_angle
-        self.angular_speed = delta_angle / delta_time  # 直接得到 度/秒
+        # 2. 中值滤波：排序后掐头去尾（去除最大和最小的约20%），取中间值的平均
+        instantaneous_speeds.sort()
+        trim_count = max(1, len(instantaneous_speeds) // 5) # 8 // 5 == 1
+        trimmed_speeds = instantaneous_speeds[trim_count : len(instantaneous_speeds) - trim_count]
+
+        if not trimmed_speeds:
+            self.angular_speed = instantaneous_speeds[len(instantaneous_speeds)//2] # 降级取中位数
+        else:
+            self.angular_speed = sum(trimmed_speeds) / len(trimmed_speeds) # 截尾均值
+
+        print(f"最终角速度: {self.angular_speed}, 瞬时速度采样列表: {instantaneous_speeds}, 中值滤波后列表: {trimmed_speeds}")
 
         return self.angular_speed > self.cfg.MIN_ANGULAR_SPEED_DPS
 
@@ -551,16 +596,17 @@ class App:
         self.detector = QTEDetector(w, h, self.cfg)
         self.tracker = QTETracker(self.cfg)
 
-    def _process_and_render(self, frame: np.ndarray, frame_elapsed: float = 0, cap_elapsed: float = 0, topmost: bool = False) -> bool:
+    def _process_and_render(self, frame: np.ndarray, frame_elapsed: float = 0, cap_elapsed: float = 0, processing_elapsed: float = 0, topmost: bool = False) -> bool:
         """统一处理一帧图像：检测 -> 追踪 -> 渲染"""
         if self.detector is None or self.tracker is None:
             return False
         
         # 检测与追踪
         red_angle, yellow_span = self.detector.process_frame(frame)
-        is_hit = self.tracker.update_and_check(red_angle, yellow_span)
+
+        is_hit = self.tracker.update_and_check(red_angle, yellow_span, processing_elapsed)
         
-        # 渲染可视化 (逻辑已内聚到Detector)
+        # 渲染可视化
         vis_frame = self.detector.render_debug(
             frame, red_angle, self.tracker.locked_yellow_span, 
             self.tracker.status_msg, is_hit
@@ -581,7 +627,7 @@ class App:
         if fps_text:
             cv2.putText(vis_frame, fps_text, (30, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
         
-        # 缩放以更好显示
+        # 置顶并缩放以更好显示
         window_name = "Identity V QTE Auto-Handler"
         if topmost:
             cv2.namedWindow(window_name)
@@ -691,20 +737,48 @@ class App:
                     print(f"[*] 窗口尺寸变化: {w}x{h}")
                     w, h = self._handle_aspect_ratio_check(w, h)
                     self._init_components(w, h)
+
+                if self.tracker is None or self.detector is None:
+                    raise TypeError
                 
                 monitor = {"top": top, "left": left, "width": w, "height": h}
                 
-                start_time = time.perf_counter()
+                # 开始测量处理时间
+                frame_start_time = time.perf_counter()
 
                 # MSS 截图
                 img = np.array(self.sct.grab(monitor))
                 frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-
-                cap_elapsed = time.perf_counter() - start_time
+                
+                # 截图+转码耗时
+                cap_elapsed = time.perf_counter() - frame_start_time
                 
                 # 检测与追踪
-                is_hit = self._process_and_render(frame, elapsed, cap_elapsed, self.cfg.PREVIEW_WINDOW_TOP_MOST)
+                red_angle, yellow_span = self.detector.process_frame(frame)
+
+                # 计算到此时为止，本帧已经消耗的处理时间（截图+检测）
+                processing_elapsed = time.perf_counter() - frame_start_time
+
+                # 传入 processing_elapsed 用于精准睡眠扣除
+                is_hit = self.tracker.update_and_check(red_angle, yellow_span, processing_elapsed)
+
+                # 渲染（渲染耗时不需要算在精准睡眠的抵消内，因为按键在渲染前已经触发了）
+                vis_frame = self.detector.render_debug(
+                    frame, red_angle, self.tracker.locked_yellow_span, 
+                    self.tracker.status_msg, is_hit
+                )
+                # ... 渲染 FPS 和 imshow 的代码合并到下面 ...
+                fps = 1.0 / max(elapsed, 1e-6)
+                fps_text = f"FPS: {fps:.2f} | MSS: {cap_elapsed*1000:.2f}ms"
+                cv2.putText(vis_frame, fps_text, (30, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
                 
+                window_name = "Identity V QTE Auto-Handler"
+                if self.cfg.PREVIEW_WINDOW_TOP_MOST:
+                    cv2.namedWindow(window_name)
+                    cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
+                show_frame = cv2.resize(vis_frame, (960, 540))
+                cv2.imshow(window_name, show_frame)
+
                 if is_hit:
                     self.input_ctrl.press_space()
                     print(">>> 触发按键: Space <<<")
