@@ -69,14 +69,15 @@ class Config:
     END_ANGLE: int = 340
     
     # 追踪器参数
-    SYSTEM_DELAY_MS: float = 50.0         # 精准触发延迟阈值，当计算的剩余QTE命中时间小于此值时，将直接阻塞至触发时刻，防止跳帧错过QTE
+    SYSTEM_DELAY_MS: float = 10.0          # 延迟补偿时间（结合云游戏延迟换算），提前触发
     COOLDOWN_SEC: float = 1.5             # QTE击打触发后的冷却时间（秒）
-    HISTORY_LENGTH: int = 8
-    MIN_ANGULAR_SPEED_DPS: float = 30.0   # 红色指针的最小角速度阈值（度/秒），转动过慢将被忽略
+    HISTORY_LENGTH: int = 4
+    MIN_ANGULAR_SPEED_DPS: float = 60.0   # 红色指针的最小角速度阈值（度/秒），转动过慢将被忽略
     # （新出现的红色指针应位于圆弧左侧，角度小于此阈值才视为合法QTE指针，排除场景红色物体误判）
     NEW_RED_MAX_ANGLE: float = 215.0      # 红色指针首次出现时的最大允许角度（度）
     # （第五人格的完美校准（角度）黄色范围通常为5度左右）
-    MIN_YELLOW_SPAN_DEG: float = 3.0      # 允许的最小QTE黄色区域范围（角），将过滤掉小于此角度的黄色区域
+    MIN_YELLOW_SPAN_DEG: float = 4.0      # 允许的最小QTE黄色区域范围（角），将过滤掉小于此角度的黄色区域
+    MAX_YELLOW_SPAN_DEG: float = 10.0     # 允许的最大QTE黄色区域范围（角），将过滤掉大于此角度的黄色区域
     # （锁存黄色区域并延迟消失，防止红色指针盖住黄色区域影响HSV范围导致无法识别黄色区域）
     # （锁存后黄色区域短暂识别失败也能正常QTE）
     YELLOW_LAG_SEC: float = 0.5           # 黄色区域稳定与滞后时间
@@ -243,7 +244,7 @@ class QTEDetector:
         # 生成掩膜并从掩膜面积计算噪点面积过滤阈值
         self.arc_mask, self.arc_mask_area = self._generate_circular_arc_mask(width, height)
         self.min_red_area = max(1, int(self.arc_mask_area * 0.001))
-        self.min_yellow_area = max(1, int(self.arc_mask_area * 0.002))
+        self.min_yellow_area = max(1, int(self.arc_mask_area * 0.005))
         # 计算模糊预处理强度
         k_size = max(3, int(height / 300))
         if k_size % 2 == 0: k_size += 1
@@ -276,12 +277,24 @@ class QTEDetector:
         cv2.fillPoly(mask, [polygon_pts], 255)
         return mask, cv2.countNonZero(mask)
     
-    def process_frame(self, frame: np.ndarray) -> Tuple[Optional[float], Optional[Tuple[float, float]]]:
-        """仅负责检测"""
-        # 只在ROI区域做HSV转换
+    def process_frame(self, frame: np.ndarray, is_already_roi: bool = False) -> Tuple[Optional[float], Optional[Tuple[float, float]]]:
+        """对传入帧图像进行颜色识别并提取角度。只在ROI区域做HSV转换。
+        
+        Args:
+            frame: 传入帧图像。
+            is_already_roi: 传入的图像是否已经进行ROI切片。
+
+        Returns:
+            (红色指针的任意角角度, (黄色目标范围起始任意角角度, 黄色目标范围结束任意角角度))
+
+        """
         rx, ry, rw, rh = self.arc_roi
-        frame_roi = frame[ry:ry+rh, rx:rx+rw]
-        hsv_roi = cv2.cvtColor(frame_roi, cv2.COLOR_BGR2HSV)
+
+        if not is_already_roi:
+            frame_roi = frame[ry:ry+rh, rx:rx+rw]
+            hsv_roi = cv2.cvtColor(frame_roi, cv2.COLOR_BGR2HSV)
+        else:
+            hsv_roi = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
         # 黄色提取
         mask_yellow = cv2.inRange(hsv_roi, self.cfg.YELLOW_LOWER, self.cfg.YELLOW_UPPER)
@@ -341,34 +354,50 @@ class QTEDetector:
         return (np.min(angles), np.max(angles))
     
     def render_debug(self, frame: np.ndarray, red_angle: Optional[float], 
-                     yellow_span: Optional[Tuple[float, float]], status_msg: str, is_hit: bool) -> np.ndarray:
+                     yellow_span: Optional[Tuple[float, float]], status_msg: str, is_hit: bool, is_already_roi: bool = False) -> np.ndarray:
         """负责所有的Debug绘制，返回渲染后的图像"""
         vis_frame = frame.copy()
         color = (0, 255, 0) if is_hit else (255, 255, 255)
         
+        # 根据是否为ROI，计算绘制中心和选择掩膜
+        rx, ry, rw, rh = self.arc_roi
+        if is_already_roi:
+            draw_center = (self.arc_center[0] - rx, self.arc_center[1] - ry)
+            draw_mask = self.arc_mask_roi
+            # ROI 图像较小，缩小字体和线条防止溢出
+            text_scale = 0.6
+            text_thickness = 2
+            status_pos = (20, 50)
+        else:
+            draw_center = self.arc_center
+            draw_mask = self.arc_mask
+            text_scale = 1.2
+            text_thickness = 3
+            status_pos = (300, 200)
+
         # 绘制状态
-        cv2.putText(vis_frame, status_msg, (300, 200), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+        cv2.putText(vis_frame, status_msg, status_pos, cv2.FONT_HERSHEY_SIMPLEX, text_scale, color, text_thickness)
         
         # 绘制指针
         if red_angle is not None:
             rad = math.radians(red_angle)
-            end_x = int(self.arc_center[0] + self.radius * math.cos(rad))
-            end_y = int(self.arc_center[1] + self.radius * math.sin(rad))
+            end_x = int(draw_center[0] + self.radius * math.cos(rad))
+            end_y = int(draw_center[1] + self.radius * math.sin(rad))
             cv2.circle(vis_frame, (end_x, end_y), 4, (255, 0, 255), -1)
             if status_msg != "Red Not On Left Side":
-                cv2.line(vis_frame, self.arc_center, (end_x, end_y), (0, 0, 255), 2)
+                cv2.line(vis_frame, draw_center, (end_x, end_y), (0, 0, 255), 2)
             
         # 绘制掩膜轮廓
-        contours, _ = cv2.findContours(self.arc_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(draw_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(vis_frame, contours, -1, (255, 255, 255), 1)
 
         # 绘制黄色目标
         if yellow_span:
             for angle in yellow_span:
                 rad = math.radians(angle)
-                end_x = int(self.arc_center[0] + self.radius * math.cos(rad))
-                end_y = int(self.arc_center[1] + self.radius * math.sin(rad))
-                cv2.line(vis_frame, self.arc_center, (end_x, end_y), (0, 255, 255), 2)
+                end_x = int(draw_center[0] + self.radius * math.cos(rad))
+                end_y = int(draw_center[1] + self.radius * math.sin(rad))
+                cv2.line(vis_frame, draw_center, (end_x, end_y), (0, 255, 255), 2)
 
         return vis_frame
 
@@ -391,17 +420,8 @@ class QTETracker:
         self.locked_yellow_span = None
         self.status_msg = "Waiting"
 
-    def update_and_check(self, red_front_angle: Optional[float], yellow_span: Optional[Tuple[float, float]], processing_elapsed: float = 0.0) -> bool:
-        """更新状态并执行指针判断。
-
-        Args:
-            red_front_angle: 当前帧的红色指针指向的任意角角度。
-            yellow_span: 黄色目标区域(起始, 截止)的任意角角度范围。
-            processing_elapsed: 当前帧已消耗的处理时间(秒)。
-
-        Returns:
-            bool: 是否应该触发QTE按键击打
-        """
+    def update_and_check(self, red_front_angle: Optional[float], yellow_span: Optional[Tuple[float, float]]) -> bool:
+        """返回是否应该触发按键"""
         current_time = time.perf_counter()
 
         if self.triggered:
@@ -415,8 +435,11 @@ class QTETracker:
 
         if red_front_angle is None: # 没有检测到红色指针
             self.status_msg = "No Red"
-            self.yellow_history.clear()
             self.red_angle_history.clear()
+            if self.yellow_history and current_time - self.yellow_history[-1][1] > self.cfg.YELLOW_LAG_SEC:
+                # 黄色区域的最新采样时间不在时间窗口内（已过期），则清除锁存
+                self.yellow_history.clear()
+                self.locked_yellow_span = None
             return False
             
         # 新红色指针出现时（历史为空），验证其是否在圆弧左侧
@@ -430,80 +453,45 @@ class QTETracker:
             self.status_msg = "Red Not Moving/Too Slow"
             return False
 
+        # 更新黄色目标区域状态
         if not self._update_yellow_state(yellow_span, current_time):
             self.status_msg = "Yellow Missing/Unstable"
             return False
 
         if self.locked_yellow_span is None:
             return False
-        
-        # 时间驱动触发
-        target_angle = self.locked_yellow_span[0]
-        delta_angle = target_angle - red_front_angle
 
-        if delta_angle <= 0: # 指针已经进入校准区域，立刻触发补救
-            self._execute_trigger()
-            return True
-        # 基于中值滤波后的速度，计算到达目标所需的时间（秒）
-        time_to_target = delta_angle / self.angular_speed
-        # 转换系统延迟阈值配置为单位秒
-        system_delay_threshold = self.cfg.SYSTEM_DELAY_MS / 1000.0
-        # 当剩余到达时间小于系统延迟阈值时，进入精准触发程序，防止脚本跳帧
-        if time_to_target <= system_delay_threshold:
-            # 计算需要精准睡眠的时间
-            wait_time = time_to_target - processing_elapsed
-            if wait_time > 0:
-                # 精准睡眠，将按键时机精度从帧间隔(如40ms)提升到睡眠精度(1~2ms)
-                print(f"sleep for {wait_time * 1000:.2f}ms")
-                time.sleep(wait_time)
-            self._execute_trigger()
+        # 基于到达时间的预判
+        target_angle = self.locked_yellow_span[0]
+        # 延迟补偿 (self.angular_speed 已经是 度/秒)
+        delay_compensation_angle = self.angular_speed * (self.cfg.SYSTEM_DELAY_MS / 1000.0)
+        # 拿到延迟补偿后当前指针所指角度
+        current_projected_angle = red_front_angle + delay_compensation_angle
+        
+        if current_projected_angle >= target_angle: # 判定指针已经到达目标
+            self.triggered = True
+            self.last_trigger_time = current_time
+            self.status_msg = ">>> HIT! SPACE <<<"
+            self.red_angle_history.clear()
+            self.locked_yellow_span = None
             return True
             
         self.status_msg = f"Approaching... R:{red_front_angle:.1f} T:{target_angle:.1f}"
         return False
+
     
-    def _execute_trigger(self):
-        """执行触发状态的重置与标记"""
-        self.triggered = True
-        self.last_trigger_time = time.perf_counter()
-        self.status_msg = ">>> HIT! SPACE <<<"
-        self.red_angle_history.clear()
-        self.locked_yellow_span = None
-
     def _check_red_moving_right(self) -> bool:
-        """检测红色指针是否正在向右顺时针旋转，即角速度是否大于设置值。
-
-        使用中值滤波计算角速度，剔除采样混叠产生的异常速度。
-
-        Returns:
-            红色指针是否正在向右顺时针旋转
-        """
+        """检测红色指针是否正在向右顺时针旋转"""
         if len(self.red_angle_history) < self.cfg.HISTORY_LENGTH:
             return False # 记录红色指针的队列未满，直接返回
-        
-        # 1. 计算相邻两帧之间的瞬时速度
-        instantaneous_speeds = []
-        for i in range(1, len(self.red_angle_history)):
-            prev_angle, prev_time = self.red_angle_history[i-1]
-            curr_angle, curr_time = self.red_angle_history[i]
-            dt = curr_time - prev_time
-            if dt < 1e-6: continue # 防除零
-            da = curr_angle - prev_angle
-            instantaneous_speeds.append(da / dt)
+        first_angle, first_time = self.red_angle_history[0]
+        last_angle, last_time = self.red_angle_history[-1]
 
-        if not instantaneous_speeds: return False
+        delta_time = last_time - first_time
+        if delta_time < 1e-6: return False  # 防除零
 
-        # 2. 中值滤波：排序后掐头去尾（去除最大和最小的约20%），取中间值的平均
-        instantaneous_speeds.sort()
-        trim_count = max(1, len(instantaneous_speeds) // 5) # 8 // 5 == 1
-        trimmed_speeds = instantaneous_speeds[trim_count : len(instantaneous_speeds) - trim_count]
-
-        if not trimmed_speeds:
-            self.angular_speed = instantaneous_speeds[len(instantaneous_speeds)//2] # 降级取中位数
-        else:
-            self.angular_speed = sum(trimmed_speeds) / len(trimmed_speeds) # 截尾均值
-
-        print(f"最终角速度: {self.angular_speed}, 瞬时速度采样列表: {instantaneous_speeds}, 中值滤波后列表: {trimmed_speeds}")
+        delta_angle = last_angle - first_angle
+        self.angular_speed = delta_angle / delta_time  # 直接得到 度/秒
 
         return self.angular_speed > self.cfg.MIN_ANGULAR_SPEED_DPS
 
@@ -516,16 +504,11 @@ class QTETracker:
         if current_yellow_span is not None: # 当前这一帧存在检测到的黄色区域
             # 记录当前黄色区域信息
             self.yellow_history.append((current_yellow_span, current_time))
-            # 检查在时间窗口内是否有足够稳定的记录 (至少4帧)
-            if len(self.yellow_history) >= 2:
-                starts = [s[0][0] for s in self.yellow_history]
-                ends = [s[0][1] for s in self.yellow_history]
-                if (max(starts)-min(starts) <= self.cfg.YELLOW_STABLE_TOLERANCE and max(ends)-min(ends) <= self.cfg.YELLOW_STABLE_TOLERANCE):
-                    # 稳定时间窗口内记录的所有记录都稳定在若差范围内
-                    span_width = current_yellow_span[1] - current_yellow_span[0]
-                    if span_width >= self.cfg.MIN_YELLOW_SPAN_DEG: # 过滤掉（角度）范围过小的黄色噪点
-                        # 锁存满足条件的状态
-                        self.locked_yellow_span = current_yellow_span
+            # 直接锁存，无需等待稳定性验证
+            span_width = current_yellow_span[1] - current_yellow_span[0]
+            if self.cfg.MIN_YELLOW_SPAN_DEG < span_width < self.cfg.MAX_YELLOW_SPAN_DEG: # 过滤掉（角度）范围过小或过大的黄色噪点
+                # 锁存满足条件的状态
+                self.locked_yellow_span = current_yellow_span
             return self.locked_yellow_span is not None # 返回锁存信息存在状态
         else: # 当前这一帧没有检测到黄色区域
             if self.locked_yellow_span is not None: # 存在锁存信息
@@ -596,46 +579,41 @@ class App:
         self.detector = QTEDetector(w, h, self.cfg)
         self.tracker = QTETracker(self.cfg)
 
-    def _process_and_render(self, frame: np.ndarray, frame_elapsed: float = 0, cap_elapsed: float = 0, processing_elapsed: float = 0, topmost: bool = False) -> bool:
-        """统一处理一帧图像：检测 -> 追踪 -> 渲染"""
-        if self.detector is None or self.tracker is None:
-            return False
-        
-        # 检测与追踪
-        red_angle, yellow_span = self.detector.process_frame(frame)
+    def _show_live_preview(self, frame: np.ndarray, red_angle: Optional[float], yellow_span: Optional[Tuple[float, float]], status_msg: str, is_hit: bool, elapsed: float, cap_elapsed: float):
+        """实时屏幕捕获模式的独立预览渲染逻辑"""
+        assert self.detector is not None
 
-        is_hit = self.tracker.update_and_check(red_angle, yellow_span, processing_elapsed)
-        
-        # 渲染可视化
-        vis_frame = self.detector.render_debug(
-            frame, red_angle, self.tracker.locked_yellow_span, 
-            self.tracker.status_msg, is_hit
-        )
+        vis_frame = self.detector.render_debug(frame, red_angle, yellow_span, status_msg, is_hit, True)
         
         # 计算FPS显示
-        fps_text = ""
-        if frame_elapsed:
-            # 计算帧率（防除0）
-            fps = 1.0 / max(frame_elapsed, 1e-6)
-            elapsed_ms = frame_elapsed * 1000
-            fps_text += f"FPS: {fps:.2f} | Elapsed: {elapsed_ms:.2f}ms "
-            if cap_elapsed:
-                cap_elapsed_ms = cap_elapsed * 1000
-                fps_text += f"| MSS: {cap_elapsed_ms:.2f}ms"
-
-        # 添加FPS显示
-        if fps_text:
-            cv2.putText(vis_frame, fps_text, (30, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+        if elapsed:
+            fps = 1.0 / max(elapsed, 1e-6)
+            cap_elapsed_ms = cap_elapsed * 1000
+            fps_text = f"FPS: {fps:.2f} | MSS: {cap_elapsed_ms:.2f}ms"
+            cv2.putText(vis_frame, fps_text, (20, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
-        # 置顶并缩放以更好显示
         window_name = "Identity V QTE Auto-Handler"
-        if topmost:
+        if self.cfg.PREVIEW_WINDOW_TOP_MOST:
             cv2.namedWindow(window_name)
             cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
-        show_frame = cv2.resize(vis_frame, (960, 540))
+        show_frame = cv2.resize(vis_frame, (530, 192))
         cv2.imshow(window_name, show_frame)
+
+    def _show_video_preview(self, frame: np.ndarray, red_angle: Optional[float], yellow_span: Optional[Tuple[float, float]], status_msg: str, is_hit: bool, elapsed: float):
+        """视频分析模式的独立预览渲染逻辑"""
+        assert self.detector is not None
+
+        vis_frame = self.detector.render_debug(frame, red_angle, yellow_span, status_msg, is_hit, False)
         
-        return is_hit
+        # 计算FPS显示
+        if elapsed:
+            fps = 1.0 / max(elapsed, 1e-6)
+            elapsed_ms = elapsed * 1000
+            fps_text = f"FPS: {fps:.2f} | Elapsed: {elapsed_ms:.2f}ms"
+            cv2.putText(vis_frame, fps_text, (30, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+        
+        show_frame = cv2.resize(vis_frame, (960, 540))
+        cv2.imshow("Identity V QTE Auto-Handler", show_frame)
 
     def analyse_video(self, video_path: str):
         try:
@@ -651,6 +629,8 @@ class App:
             self._init_components(w, h)
             print("[*] QTE 视频分析已启动")
 
+            assert self.detector is not None
+
             while True:
                 # 在循环最开始记录当前时间
                 current_time = time.perf_counter()
@@ -663,7 +643,11 @@ class App:
                     break
 
                 # 检测与追踪
-                is_hit = self._process_and_render(frame, elapsed, 0, False)
+                red_angle, yellow_span = self.detector.process_frame(frame)
+                is_hit = self.tracker.update_and_check(red_angle, yellow_span)
+
+                # 渲染可视化
+                self._show_video_preview(frame, red_angle, self.tracker.locked_yellow_span, self.tracker.status_msg, is_hit, elapsed)
 
                 if is_hit:
                     print(">>> 触发按键: Space <<<")
@@ -685,9 +669,7 @@ class App:
         # 1. 管理员权限校验
         if not self.win_mgr.is_admin():
             print("[X] 错误：请右键使用管理员权限运行此脚本！")
-            input("按回车键退出...")
             sys.exit(1)
-        print("[+] 管理员权限验证通过。")
 
         # 诊断：输出当前 DPI 缩放信息
         dpi_scale = self.win_mgr.get_dpi_scale()
@@ -741,47 +723,29 @@ class App:
                 if self.tracker is None or self.detector is None:
                     raise TypeError
                 
-                monitor = {"top": top, "left": left, "width": w, "height": h}
+                # 仅捕获ROI以提升速度
+                rx, ry, rw, rh = self.detector.arc_roi
+                monitor = {"top": top + ry, "left": left + rx, "width": rw, "height": rh}
                 
-                # 开始测量处理时间
-                frame_start_time = time.perf_counter()
+                start_time = time.perf_counter()
 
                 # MSS 截图
                 img = np.array(self.sct.grab(monitor))
                 frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
                 
                 # 截图+转码耗时
-                cap_elapsed = time.perf_counter() - frame_start_time
+                cap_elapsed = time.perf_counter() - start_time
                 
                 # 检测与追踪
-                red_angle, yellow_span = self.detector.process_frame(frame)
-
-                # 计算到此时为止，本帧已经消耗的处理时间（截图+检测）
-                processing_elapsed = time.perf_counter() - frame_start_time
-
-                # 传入 processing_elapsed 用于精准睡眠扣除
-                is_hit = self.tracker.update_and_check(red_angle, yellow_span, processing_elapsed)
-
-                # 渲染（渲染耗时不需要算在精准睡眠的抵消内，因为按键在渲染前已经触发了）
-                vis_frame = self.detector.render_debug(
-                    frame, red_angle, self.tracker.locked_yellow_span, 
-                    self.tracker.status_msg, is_hit
-                )
-                # ... 渲染 FPS 和 imshow 的代码合并到下面 ...
-                fps = 1.0 / max(elapsed, 1e-6)
-                fps_text = f"FPS: {fps:.2f} | MSS: {cap_elapsed*1000:.2f}ms"
-                cv2.putText(vis_frame, fps_text, (30, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-                
-                window_name = "Identity V QTE Auto-Handler"
-                if self.cfg.PREVIEW_WINDOW_TOP_MOST:
-                    cv2.namedWindow(window_name)
-                    cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
-                show_frame = cv2.resize(vis_frame, (960, 540))
-                cv2.imshow(window_name, show_frame)
+                red_angle, yellow_span = self.detector.process_frame(frame, True)
+                is_hit = self.tracker.update_and_check(red_angle, yellow_span)
 
                 if is_hit:
                     self.input_ctrl.press_space()
                     print(">>> 触发按键: Space <<<")
+
+                # 渲染预览
+                self._show_live_preview(frame, red_angle, self.tracker.locked_yellow_span, self.tracker.status_msg, is_hit, elapsed, cap_elapsed)
                 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
