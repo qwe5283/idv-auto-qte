@@ -62,16 +62,16 @@ class Config:
     YELLOW_UPPER: np.ndarray = field(default_factory=lambda: np.array([23, 140, 255]))
     
     # 圆弧归一化几何参数 (基于16:9比例)
-    ARC_CENTER: Tuple[float, float] = (0.503, 0.833)
+    ARC_CENTER: Tuple[float, float] = (0.504, 0.834)
     RADIUS: float = 0.313
-    THICKNESS: float = 0.02
+    THICKNESS: float = 0.016
     START_ANGLE: int = 200
     END_ANGLE: int = 340
     
     # 追踪器参数
     SYSTEM_DELAY_MS: float = 10.0          # 延迟补偿时间（结合云游戏延迟换算），提前触发
     COOLDOWN_SEC: float = 1.5             # QTE击打触发后的冷却时间（秒）
-    HISTORY_LENGTH: int = 4
+    HISTORY_LENGTH: int = 8
     MIN_ANGULAR_SPEED_DPS: float = 60.0   # 红色指针的最小角速度阈值（度/秒），转动过慢将被忽略
     # （新出现的红色指针应位于圆弧左侧，角度小于此阈值才视为合法QTE指针，排除场景红色物体误判）
     NEW_RED_MAX_ANGLE: float = 215.0      # 红色指针首次出现时的最大允许角度（度）
@@ -108,6 +108,7 @@ class WindowManager:
     @staticmethod
     def get_top_level_hwnd(hwnd: int) -> int:
         """获取指定窗口的顶层父窗口"""
+        if not win32gui.IsWindow(hwnd): return 0
         while True:
             parent = win32gui.GetParent(hwnd)
             if not parent:
@@ -172,7 +173,7 @@ class WindowManager:
 
     def wait_for_focus(self, process_name: str) -> Tuple[int, str]:
         """同步阻塞，等待游戏客户端或 MuMu 模拟器成为焦点窗口，返回(顶层窗口句柄, 客户端类型)"""
-        print(f"[*] 等待进程 [{process_name}] 启动并获取焦点...")
+        print(f"[*] 等待进程 [{process_name}] 或 [MuMu模拟器] 启动并获取焦点...")
         while True:
             # 1. 尝试查找本地游戏进程
             pid = None
@@ -243,7 +244,7 @@ class QTEDetector:
         self.thickness = int(self.cfg.THICKNESS * height)
         # 生成掩膜并从掩膜面积计算噪点面积过滤阈值
         self.arc_mask, self.arc_mask_area = self._generate_circular_arc_mask(width, height)
-        self.min_red_area = max(1, int(self.arc_mask_area * 0.001))
+        self.min_red_area = max(1, int(self.arc_mask_area * 0.002))
         self.min_yellow_area = max(1, int(self.arc_mask_area * 0.005))
         # 计算模糊预处理强度
         k_size = max(3, int(height / 300))
@@ -504,11 +505,16 @@ class QTETracker:
         if current_yellow_span is not None: # 当前这一帧存在检测到的黄色区域
             # 记录当前黄色区域信息
             self.yellow_history.append((current_yellow_span, current_time))
-            # 直接锁存，无需等待稳定性验证
-            span_width = current_yellow_span[1] - current_yellow_span[0]
-            if self.cfg.MIN_YELLOW_SPAN_DEG < span_width < self.cfg.MAX_YELLOW_SPAN_DEG: # 过滤掉（角度）范围过小或过大的黄色噪点
-                # 锁存满足条件的状态
-                self.locked_yellow_span = current_yellow_span
+            # 检查在时间窗口内是否有足够稳定的记录
+            if len(self.yellow_history) >= 2:
+                starts = [s[0][0] for s in self.yellow_history] # 时间窗口内所有黄色区域的起始角度列表
+                ends = [s[0][1] for s in self.yellow_history] # 时间窗口内所有黄色区域的结束角度列表
+                if (max(starts)-min(starts) <= self.cfg.YELLOW_STABLE_TOLERANCE and max(ends)-min(ends) <= self.cfg.YELLOW_STABLE_TOLERANCE):
+                    # 稳定时间窗口内记录黄色区域的所有角度都稳定在若差范围内
+                    span_width = current_yellow_span[1] - current_yellow_span[0]
+                    if self.cfg.MIN_YELLOW_SPAN_DEG < span_width < self.cfg.MAX_YELLOW_SPAN_DEG: # 过滤掉（角度）范围过小或过大的黄色噪点
+                        # 锁存满足条件的状态
+                        self.locked_yellow_span = current_yellow_span
             return self.locked_yellow_span is not None # 返回锁存信息存在状态
         else: # 当前这一帧没有检测到黄色区域
             if self.locked_yellow_span is not None: # 存在锁存信息
@@ -555,7 +561,7 @@ class App:
         if w == 0 or h == 0 or self.hwnd is None: return w, h
         if abs((w / h) - self.cfg.TARGET_ASPECT_RATIO) < 0.15: return w, h
         
-        print(f"[!] 检测到窗口比例 {w/h:.2f} 非 16:9 ({w}x{h})")
+        print(f"[!] 检测到窗口尺寸 {w}x{h} 比例 {w/h:.2f} 非 16:9 ({w}x{h})")
 
         # 如果是 MuMu 模拟器等子窗口，无法直接调整大小
         if win32gui.GetParent(self.hwnd):
@@ -612,7 +618,8 @@ class App:
             fps_text = f"FPS: {fps:.2f} | Elapsed: {elapsed_ms:.2f}ms"
             cv2.putText(vis_frame, fps_text, (30, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
         
-        show_frame = cv2.resize(vis_frame, (960, 540))
+        # 视频预览窗口不设置过大，避免占满屏幕
+        show_frame = cv2.resize(vis_frame, (1280, 720))
         cv2.imshow("Identity V QTE Auto-Handler", show_frame)
 
     def analyse_video(self, video_path: str):
@@ -716,7 +723,6 @@ class App:
 
                 # 5. 监听窗口尺寸变化，若改变则重置识别器和追踪器
                 if self.current_size != (w, h):
-                    print(f"[*] 窗口尺寸变化: {w}x{h}")
                     w, h = self._handle_aspect_ratio_check(w, h)
                     self._init_components(w, h)
 
