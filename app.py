@@ -71,9 +71,9 @@ class Config:
     
     # 追踪器参数
     # （游戏帧率上限为60FPS，考虑游戏引擎输入队列轮询延迟）
-    SYSTEM_DELAY_MS: float = 20.0         # 延迟补偿时间（结合云游戏延迟换算），提前触发
+    SYSTEM_DELAY_MS: float = 15.0         # 延迟补偿时间（结合云游戏延迟换算），提前触发
     COOLDOWN_SEC: float = 1.5             # QTE击打触发后的冷却时间（秒）
-    HISTORY_LENGTH: int = 8               # 用于计算红色指针运动趋势的历史记录长度（帧数），仅用于计算红色指针角速度
+    RED_TIME_WINDOW_SEC: float = 0.4      # 红色指针运动趋势的采样时间窗口（秒），仅用于维护计算红色指针角速度所用队列
     # （游戏中的红色指针的速度通常在120度/秒左右）
     MIN_ANGULAR_SPEED_DPS: float = 60.0   # 红色指针的最小角速度阈值（度/秒），转动过慢将被忽略
     # （新出现的红色指针应位于圆弧左侧，角度小于此阈值才视为合法QTE指针，排除场景红色物体误判）
@@ -479,7 +479,7 @@ class QTETracker:
         self.triggered = False
         self.last_trigger_time = 0.0  # 记录上次触发的时间戳用于计算冷却
         
-        self.red_angle_history = deque(maxlen=self.cfg.HISTORY_LENGTH) # 存储 (角度, 时间戳)
+        self.red_angle_history = deque() # 存储 (角度, 时间戳)
         self.angular_speed = 0.0 # 度/秒
 
         self.yellow_history = deque()  # 存储 (角度跨度, 时间戳)
@@ -515,7 +515,7 @@ class QTETracker:
 
         # 检测红色指针是否停止转动
         self.red_angle_history.append((red_front_angle, current_time))
-        if not self._check_red_moving_right():
+        if not self._check_red_moving_right(current_time):
             self.status_msg = "Red Not Moving/Too Slow"
             return False
 
@@ -540,27 +540,37 @@ class QTETracker:
             self.status_msg = ">>> HIT! SPACE <<<"
             self.red_angle_history.clear()
             self.locked_yellow_span = None
+            print(f"[DEBUG] Red Angular Speed: {self.angular_speed:.1f} deg/s")
             return True
             
         self.status_msg = f"Approaching... R:{red_front_angle:.1f} T:{target_angle:.1f}"
         return False
 
-    
-    def _check_red_moving_right(self) -> bool:
+    def _check_red_moving_right(self, current_time: float) -> bool:
         """检测红色指针是否正在向右顺时针旋转"""
-        if len(self.red_angle_history) < self.cfg.HISTORY_LENGTH:
-            return False # 记录红色指针的队列未满，直接返回
-        first_angle, first_time = self.red_angle_history[0]
-        last_angle, last_time = self.red_angle_history[-1]
-
-        delta_time = last_time - first_time
-        if delta_time < 1e-6: return False  # 防除零
-
-        delta_angle = last_angle - first_angle
-        self.angular_speed = delta_angle / delta_time  # 直接得到 度/秒
-
-        return self.angular_speed > self.cfg.MIN_ANGULAR_SPEED_DPS
-
+        # 清理超过时间窗口的红色历史记录
+        while self.red_angle_history and current_time - self.red_angle_history[0][1] > self.cfg.RED_TIME_WINDOW_SEC:
+            self.red_angle_history.popleft()
+        if len(self.red_angle_history) < 5:
+            return False # 至少5个采样点再开始计算速度
+        
+        speeds = []
+        for i in range(1, len(self.red_angle_history)):
+            prev_angle, prev_time = self.red_angle_history[i-1]
+            curr_angle, curr_time = self.red_angle_history[i]
+            delta_time = curr_time - prev_time
+            delta_angle = curr_angle - prev_angle
+            if delta_angle <= 0:
+                continue # 只考虑顺时针旋转的样本，过滤掉但渲染帧重复采样造成不动的情况
+            speeds.append(delta_angle / delta_time) # 计算每个连续样本的瞬时角速度
+        if not speeds:  
+            return False  # 时间窗口内没有足够有效的跨帧样本计算速度
+        # 计算瞬时速度的中位数，防止异常值或重复采样造成的速度毛刺干扰
+        median_speed = float(np.median(speeds))
+        if median_speed > self.cfg.MIN_ANGULAR_SPEED_DPS:
+            self.angular_speed = median_speed
+            return True
+        return False
     
     def _update_yellow_state(self, current_yellow_span: Optional[Tuple[float, float]], current_time: float) -> bool:
         """记录和维护黄色区域的锁存状态，排除黄色噪点引发的干扰，返回黄色区域状态是否靠谱且可用"""
@@ -701,8 +711,6 @@ class App:
         # 视频预览窗口不设置过大，避免占满屏幕
         show_frame = cv2.resize(vis_frame, (1280, 720))
         cv2.imshow("Identity V QTE Auto-Handler", show_frame)
-
-        time.sleep(0.02) # 控制预览速度，避免过快
 
     def analyse_video(self, video_path: str):
         try:
