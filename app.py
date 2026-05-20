@@ -70,7 +70,8 @@ class Config:
     END_ANGLE: int = 340
     
     # 追踪器参数
-    SYSTEM_DELAY_MS: float = 10.0         # 延迟补偿时间（结合云游戏延迟换算），提前触发
+    # （游戏帧率上限为60FPS，考虑游戏引擎输入队列轮询延迟）
+    SYSTEM_DELAY_MS: float = 20.0         # 延迟补偿时间（结合云游戏延迟换算），提前触发
     COOLDOWN_SEC: float = 1.5             # QTE击打触发后的冷却时间（秒）
     HISTORY_LENGTH: int = 8               # 用于计算红色指针运动趋势的历史记录长度（帧数），仅用于计算红色指针角速度
     # （游戏中的红色指针的速度通常在120度/秒左右）
@@ -432,7 +433,7 @@ class QTETracker:
         self.locked_yellow_span = None
         self.status_msg = "Waiting"
 
-    def update_and_check(self, red_front_angle: Optional[float], yellow_span: Optional[Tuple[float, float]]) -> bool:
+    def update_and_check(self, red_front_angle: Optional[float], yellow_span: Optional[Tuple[float, float]], delay_ms: float = 0.0) -> bool:
         """返回是否应该触发按键"""
         current_time = time.perf_counter()
 
@@ -476,7 +477,7 @@ class QTETracker:
         # 基于到达时间的预判
         target_angle = self.locked_yellow_span[0]
         # 延迟补偿 (self.angular_speed 已经是 度/秒)
-        delay_compensation_angle = self.angular_speed * (self.cfg.SYSTEM_DELAY_MS / 1000.0)
+        delay_compensation_angle = self.angular_speed * (delay_ms / 1000.0)
         # 拿到延迟补偿后当前指针所指角度
         current_projected_angle = red_front_angle + delay_compensation_angle
         
@@ -755,7 +756,7 @@ class App:
                 
                 # 检测与追踪
                 red_angle, yellow_span = self.detector.process_frame(frame, True)
-                is_hit = self.tracker.update_and_check(red_angle, yellow_span)
+                is_hit = self.tracker.update_and_check(red_angle, yellow_span, self.cfg.SYSTEM_DELAY_MS)
 
                 if is_hit:
                     self.input_ctrl.press_space()
