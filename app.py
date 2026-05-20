@@ -64,7 +64,7 @@ class Config:
     # 圆弧归一化几何参数 (基于16:9比例)
     ARC_CENTER: Tuple[float, float] = (0.504, 0.834)
     RADIUS: float = 0.313
-    THICKNESS: float = 0.016
+    THICKNESS: float = 0.02
     START_ANGLE: int = 200
     END_ANGLE: int = 340
     
@@ -81,7 +81,7 @@ class Config:
     MAX_YELLOW_SPAN_DEG: float = 10.0     # 允许的最大QTE黄色区域范围（角），将过滤掉大于此角度的黄色区域
     # （锁存黄色区域并延迟消失，防止红色指针盖住黄色区域影响HSV范围导致无法识别黄色区域）
     # （锁存后黄色区域短暂识别失败也能正常QTE）
-    YELLOW_LAG_SEC: float = 0.5           # 黄色区域稳定与滞后时间
+    YELLOW_LAG_SEC: float = 0.4           # 黄色区域稳定与滞后时间（秒），设置过大可能导致错过角度较小的QTE
     # （要求黄色区域持续存在YELLOW_LAG_SEC秒且时间窗口内角度波动变化都稳定在YELLOW_STABLE_TOLERANCE度内，才算作有效QTE范围，防止场景中漂浮的粒子进入ROI影响识别误判）
     YELLOW_STABLE_TOLERANCE: float = 0.3  # 黄色区域在稳定时间窗口内的允许波动的角度范围阈值
 
@@ -246,7 +246,7 @@ class QTEDetector:
         # 生成掩膜并从掩膜面积计算噪点面积过滤阈值
         self.arc_mask, self.arc_mask_area = self._generate_circular_arc_mask(width, height)
         self.min_red_area = max(1, int(self.arc_mask_area * 0.002))
-        self.min_yellow_area = max(1, int(self.arc_mask_area * 0.005))
+        self.min_yellow_area = max(1, int(self.arc_mask_area * 0.025))
         # 计算模糊预处理强度
         k_size = max(3, int(height / 300))
         if k_size % 2 == 0: k_size += 1
@@ -347,16 +347,22 @@ class QTEDetector:
         return np.max(angles)
 
     def _get_yellow_angle_span(self, mask_yellow: np.ndarray, rx: int, ry: int) -> Optional[Tuple[float, float]]:
-        points = cv2.findNonZero(mask_yellow)
-        if points is None or len(points) < self.min_yellow_area:
+        """计算黄色目标区域的起始任意角和结束任意角范围"""
+        contours, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
             return None
-        points = points.reshape(-1, 2)
-        # 中心坐标需要减去 ROI 的偏移量，转换为局部坐标系
+        # 取面积最大的轮廓，滤除散点噪声
+        max_contour = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(max_contour) < self.min_yellow_area:
+            return None
+        # 计算局部坐标系下的圆弧中心
         local_center = (self.arc_center[0] - rx, self.arc_center[1] - ry)
+        # 展平轮廓点并计算每个点相对中心的极角
+        points = max_contour.reshape(-1, 2)
         dx = points[:, 0] - local_center[0]
         dy = points[:, 1] - local_center[1]
         angles = np.degrees(np.arctan2(dy, dx))
-        angles[angles < 0] += 360
+        angles[angles < 0] += 360 # 映射到 [0, 360)
         return (np.min(angles), np.max(angles))
     
     def render_debug(self, frame: np.ndarray, red_angle: Optional[float], 
