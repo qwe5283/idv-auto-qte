@@ -53,9 +53,9 @@ class Config:
     TARGET_PROCESS_NAME: str = "dwrg.exe"
     
     # 红色HSV范围（两段）
-    RED_LOWER1: np.ndarray = field(default_factory=lambda: np.array([0, 127, 90]))
+    RED_LOWER1: np.ndarray = field(default_factory=lambda: np.array([0, 157, 90]))
     RED_UPPER1: np.ndarray = field(default_factory=lambda: np.array([8, 255, 255]))
-    RED_LOWER2: np.ndarray = field(default_factory=lambda: np.array([175, 127, 90]))
+    RED_LOWER2: np.ndarray = field(default_factory=lambda: np.array([175, 157, 90]))
     RED_UPPER2: np.ndarray = field(default_factory=lambda: np.array([180, 255, 255]))
     
     # 黄色HSV范围
@@ -86,6 +86,9 @@ class Config:
     YELLOW_LAG_SEC: float = 0.4           # 黄色区域稳定与滞后时间（秒），设置过大可能导致错过角度较小的QTE
     # （要求黄色区域持续存在YELLOW_LAG_SEC秒且时间窗口内角度波动变化都稳定在YELLOW_STABLE_TOLERANCE度内，才算作有效QTE范围，防止场景中漂浮的粒子进入ROI影响识别误判）
     YELLOW_STABLE_TOLERANCE: float = 0.3  # 黄色区域在稳定时间窗口内的允许波动的角度范围阈值
+    # 红色指针特征过滤参数
+    RED_INNER_EXTEND_MULT: float = 4.0    # 红色指针检测时，向内拓展厚度的倍数（构建超集ROI在更大范围检测红色指针）
+    RED_RADIAL_SEGMENTS: int = 8          # 红色指针检测时，径向分段数（3=内/中/外环，2=内/外环）。段数越多抗噪越强，但易漏检细指针
 
     # 预览
     PREVIEW_VIDEO_HIT_TIME_SEC: float = 3 # 视频分析模式下，停留预览命中结果展示的时长（秒）
@@ -246,7 +249,7 @@ class QTEDetector:
         self.thickness = int(self.cfg.THICKNESS * height)
         # 生成掩膜并从掩膜面积计算噪点面积过滤阈值
         self.arc_mask, self.arc_mask_area = self._generate_circular_arc_mask(width, height)
-        self.min_red_area = max(1, int(self.arc_mask_area * 0.002))
+        self.red_inner_radius = max(self.radius - int(self.thickness * self.cfg.RED_INNER_EXTEND_MULT), 1) # 计算向内拓展的红色检测内半径
         self.min_yellow_area = max(1, int(self.arc_mask_area * 0.025))
         # 计算模糊预处理强度
         k_size = max(3, int(height / 300))
@@ -280,7 +283,7 @@ class QTEDetector:
         cv2.fillPoly(mask, [polygon_pts], 255)
         return mask, cv2.countNonZero(mask)
     
-    def process_frame(self, frame: np.ndarray, is_already_roi: bool = False) -> Tuple[Optional[float], Optional[Tuple[float, float]]]:
+    def process_frame(self, frame: np.ndarray, is_already_roi: bool = False) -> Tuple[Optional[float], Optional[Tuple[float, float]], Optional[np.ndarray]]:
         """对传入帧图像进行颜色识别并提取角度。只在ROI区域做HSV转换。
         
         Args:
@@ -292,6 +295,7 @@ class QTEDetector:
 
         """
         rx, ry, rw, rh = self.arc_roi
+        h_frame, w_frame = frame.shape[:2]
 
         if not is_already_roi:
             frame_roi = frame[ry:ry+rh, rx:rx+rw]
@@ -310,42 +314,81 @@ class QTEDetector:
             cv2.inRange(hsv_roi, self.cfg.RED_LOWER2, self.cfg.RED_UPPER2)
         )
         mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, self.kernel_noise)
-        mask_red = cv2.bitwise_and(mask_red, mask_red, mask=self.arc_mask_roi)
 
-        return self._get_red_front_angle(mask_red, rx, ry), self._get_yellow_angle_span(mask_yellow, rx, ry)
+        red_angle, debug_red_mask_roi = self._get_red_front_angle(mask_red, rx, ry)
+        yellow_span = self._get_yellow_angle_span(mask_yellow, rx, ry)
 
-    def _get_red_front_angle(self, mask_red: np.ndarray, rx: int, ry: int) -> Optional[float]:
-        """计算红色指针的任意角范围角度"""
-        contours, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        valid_points = []
-        # 向内拓展检测区域
-        outer_r = self.radius
-        inner_r = self.radius - self.thickness * 3
-        # 中心坐标需要减去 ROI 的偏移量，转换为局部坐标系
-        local_center = (self.arc_center[0] - rx, self.arc_center[1] - ry)
+        # 统一将 debug_red_mask 映射回与输入 frame 相同的尺寸
+        full_debug_red_mask = np.zeros((h_frame, w_frame), dtype=np.uint8)
+        if debug_red_mask_roi is not None and np.any(debug_red_mask_roi):
+            if is_already_roi:
+                # 传入的已经是 ROI，直接赋值
+                full_debug_red_mask[:debug_red_mask_roi.shape[0], :debug_red_mask_roi.shape[1]] = debug_red_mask_roi
+            else:
+                # 传入的是全图，放回对应的 ROI 位置
+                h_roi, w_roi = debug_red_mask_roi.shape[:2]
+                full_debug_red_mask[ry:ry+h_roi, rx:rx+w_roi] = debug_red_mask_roi
 
-        for cnt in contours:
-            if cv2.contourArea(cnt) > self.min_red_area: # 过滤掉小面积噪点
-                points = cnt.reshape(-1, 2)
-                # 转化为以指针中心为原点的向量并计算向量模长
-                dx = points[:, 0] - local_center[0]
-                dy = points[:, 1] - local_center[1]
-                dist = np.sqrt(dx**2 + dy**2)
-                # 过滤掉拓展检测区域但不在ROI圆弧范围内的点
-                mask_dist = (dist >= inner_r) & (dist <= outer_r)
-                if np.any(mask_dist):
-                    valid_points.append(points[mask_dist])
+        return red_angle, yellow_span, full_debug_red_mask
+
+    def _get_red_front_angle(self, mask_red: np.ndarray, rx: int, ry: int) -> Tuple[Optional[float], np.ndarray]:
+        """计算红色指针前沿的任意角范围角度（N段同心环交集法）
         
-        if not valid_points: 
-            return None
-        all_points = np.concatenate(valid_points, axis=0)
+        将连续的极角映射到0-359的离散数组，将拓展后的环形检测区分为外半环和内半环（2段时），分别统计外半环和内半环中，哪些1度区间存在红色像素
+        取交集：只有当一个角度区间在内外半环同时存在红色时，才认定该区间是指针的一部分
+        利用布尔索引，直接从原图中提取出属于这些有效区间的像素，取过滤后像素块中最大的角度作为指针前沿的任意角度。
+        """
+        ys, xs = np.where(mask_red > 0)
+        debug_mask = np.zeros_like(mask_red, dtype=np.uint8) # 初始化Debug掩膜
+        if len(xs) == 0:
+            return None, debug_mask
         
-        dx = all_points[:, 0] - local_center[0]
-        dy = all_points[:, 1] - local_center[1]
+        # 计算局部坐标系下的圆弧中心
+        local_center = (self.arc_center[0] - rx, self.arc_center[1] - ry)        
+        # 1. 计算极坐标
+        dx = xs - local_center[0]
+        dy = ys - local_center[1]
+        dist = np.sqrt(dx**2 + dy**2)
         angles = np.degrees(np.arctan2(dy, dx))
-        
         angles[angles < 0] += 360
-        return np.max(angles)
+        # 2. 过滤掉不在拓展环形区域 [inner_r, outer_r] 内的像素
+        mask_dist = (dist >= self.red_inner_radius) & (dist <= self.radius)
+        dist = dist[mask_dist]
+        angles = angles[mask_dist]
+        # 同步过滤 xs, ys 用于后续掩膜赋值
+        xs = xs[mask_dist]
+        ys = ys[mask_dist]
+
+        if len(angles) == 0:
+            return None, debug_mask
+
+        # 3. 将环形区域径向分段
+        N = self.cfg.RED_RADIAL_SEGMENTS
+        boundaries = np.linspace(self.red_inner_radius, self.radius, N + 1)
+        segment_indices = np.digitize(dist, boundaries[1:]) # np.digitize 返回每个 dist 属于哪个 bin 的索引 (1 到 N)
+        # 极角1度离散化
+        angle_bins = np.floor(angles).astype(int)
+        valid_bins = (angle_bins >= 0) & (angle_bins < 360)
+        # 4. 标记每个分段中存在的角度区间
+        segment_present = np.zeros((N, 360), dtype=bool)
+        for i in range(N):
+            mask = (segment_indices == i) & valid_bins
+            segment_present[i, angle_bins[mask]] = True
+        # 5. 核心逻辑：取所有分段的交集。必须贯穿所有环，才算指针
+        angle_valid = np.all(segment_present, axis=0) # 形状 (360,)
+        # 6. 将布尔结果映射回原始像素，提取前沿浮点角度
+        valid_pixel_mask = np.zeros(len(angles), dtype=bool)
+        valid_pixel_mask[valid_bins] = angle_valid[angle_bins[valid_bins]]
+        
+        if not np.any(valid_pixel_mask):
+            return None, debug_mask
+            
+        # 7. 提取所有贯穿区间的像素，取最大浮点角度作为顺时针前沿
+        max_angle = np.max(angles[valid_pixel_mask])
+        # 8. 生成 Debug 掩膜 (仅保留通过贯穿测试的指针像素)
+        debug_mask[ys[valid_pixel_mask], xs[valid_pixel_mask]] = 255
+
+        return max_angle, debug_mask
 
     def _get_yellow_angle_span(self, mask_yellow: np.ndarray, rx: int, ry: int) -> Optional[Tuple[float, float]]:
         """计算黄色目标区域的起始任意角和结束任意角范围"""
@@ -366,8 +409,14 @@ class QTEDetector:
         angles[angles < 0] += 360 # 映射到 [0, 360)
         return (np.min(angles), np.max(angles))
     
-    def render_debug(self, frame: np.ndarray, red_angle: Optional[float], 
-                     yellow_span: Optional[Tuple[float, float]], status_msg: str, is_hit: bool, is_already_roi: bool = False) -> np.ndarray:
+    def render_debug(self, 
+                     frame: np.ndarray, 
+                     red_angle: Optional[float], 
+                     yellow_span: Optional[Tuple[float, float]], 
+                     status_msg: str, 
+                     is_hit: bool,
+                     debug_red_mask: Optional[np.ndarray] = None, 
+                     is_already_roi: bool = False) -> np.ndarray:
         """负责所有的Debug绘制，返回渲染后的图像"""
         vis_frame = frame.copy()
         color = (0, 255, 0) if is_hit else (255, 255, 255)
@@ -378,25 +427,29 @@ class QTEDetector:
             draw_center = (self.arc_center[0] - rx, self.arc_center[1] - ry)
             draw_mask = self.arc_mask_roi
             # ROI 图像较小，缩小字体和线条防止溢出
-            text_scale = 0.6
-            text_thickness = 2
-            status_pos = (20, 50)
+            text_scale, text_thickness, status_pos = 0.6, 2, (20, 50)
         else:
             draw_center = self.arc_center
             draw_mask = self.arc_mask
-            text_scale = 1.2
-            text_thickness = 3
-            status_pos = (300, 200)
+            text_scale, text_thickness, status_pos = 1.2, 3, (300, 200)
 
         # 绘制状态
         cv2.putText(vis_frame, status_msg, status_pos, cv2.FONT_HERSHEY_SIMPLEX, text_scale, color, text_thickness)
         
+        # 绘制中间过程产物：通过贯穿测试的红色指针掩膜
+        if debug_red_mask is not None and np.any(debug_red_mask):
+            # 创建一个纯洋红色 (255, 0, 255) 的叠加层
+            overlay = np.zeros_like(vis_frame, dtype=np.uint8)
+            overlay[debug_red_mask > 0] = (255, 0, 255)
+            # 将掩膜以半透明方式叠加到原图上，让用户看清是指针的哪部分被识别
+            cv2.addWeighted(vis_frame, 1.0, overlay, 0.6, 0, vis_frame)
+
         # 绘制指针
         if red_angle is not None:
             rad = math.radians(red_angle)
             end_x = int(draw_center[0] + self.radius * math.cos(rad))
             end_y = int(draw_center[1] + self.radius * math.sin(rad))
-            cv2.circle(vis_frame, (end_x, end_y), 4, (255, 0, 255), -1)
+            cv2.circle(vis_frame, (end_x, end_y), 4, (0, 0, 255), -1)
             if status_msg != "Red Not On Left Side":
                 cv2.line(vis_frame, draw_center, (end_x, end_y), (0, 0, 255), 2)
             
@@ -597,11 +650,19 @@ class App:
         self.detector = QTEDetector(w, h, self.cfg)
         self.tracker = QTETracker(self.cfg)
 
-    def _show_live_preview(self, frame: np.ndarray, red_angle: Optional[float], yellow_span: Optional[Tuple[float, float]], status_msg: str, is_hit: bool, elapsed: float, cap_elapsed: float):
+    def _show_live_preview(self, 
+                           frame: np.ndarray, 
+                           red_angle: Optional[float], 
+                           yellow_span: Optional[Tuple[float, float]], 
+                           status_msg: str, 
+                           is_hit: bool, 
+                           elapsed: float, 
+                           cap_elapsed: float,
+                           debug_red_mask=None):
         """实时屏幕捕获模式的独立预览渲染逻辑"""
         assert self.detector is not None
 
-        vis_frame = self.detector.render_debug(frame, red_angle, yellow_span, status_msg, is_hit, True)
+        vis_frame = self.detector.render_debug(frame, red_angle, yellow_span, status_msg, is_hit, debug_red_mask, True)
         
         # 计算FPS显示
         if elapsed:
@@ -617,11 +678,18 @@ class App:
         show_frame = cv2.resize(vis_frame, (530, 192))
         cv2.imshow(window_name, show_frame)
 
-    def _show_video_preview(self, frame: np.ndarray, red_angle: Optional[float], yellow_span: Optional[Tuple[float, float]], status_msg: str, is_hit: bool, elapsed: float):
+    def _show_video_preview(self, 
+                            frame: np.ndarray, 
+                            red_angle: Optional[float],
+                            yellow_span: Optional[Tuple[float, float]], 
+                            status_msg: str, 
+                            is_hit: bool, 
+                            elapsed: float,
+                            debug_red_mask=None):
         """视频分析模式的独立预览渲染逻辑"""
         assert self.detector is not None
 
-        vis_frame = self.detector.render_debug(frame, red_angle, yellow_span, status_msg, is_hit, False)
+        vis_frame = self.detector.render_debug(frame, red_angle, yellow_span, status_msg, is_hit, debug_red_mask, False)
         
         # 计算FPS显示
         if elapsed:
@@ -633,6 +701,8 @@ class App:
         # 视频预览窗口不设置过大，避免占满屏幕
         show_frame = cv2.resize(vis_frame, (1280, 720))
         cv2.imshow("Identity V QTE Auto-Handler", show_frame)
+
+        time.sleep(0.02) # 控制预览速度，避免过快
 
     def analyse_video(self, video_path: str):
         try:
@@ -662,11 +732,11 @@ class App:
                     break
 
                 # 检测与追踪
-                red_angle, yellow_span = self.detector.process_frame(frame)
+                red_angle, yellow_span, debug_red_mask = self.detector.process_frame(frame)
                 is_hit = self.tracker.update_and_check(red_angle, yellow_span)
 
                 # 渲染可视化
-                self._show_video_preview(frame, red_angle, self.tracker.locked_yellow_span, self.tracker.status_msg, is_hit, elapsed)
+                self._show_video_preview(frame, red_angle, self.tracker.locked_yellow_span, self.tracker.status_msg, is_hit, elapsed, debug_red_mask)
 
                 if is_hit:
                     print(">>> 触发按键: Space <<<")
@@ -755,7 +825,7 @@ class App:
                 cap_elapsed = time.perf_counter() - start_time
                 
                 # 检测与追踪
-                red_angle, yellow_span = self.detector.process_frame(frame, True)
+                red_angle, yellow_span, debug_red_mask = self.detector.process_frame(frame, True)
                 is_hit = self.tracker.update_and_check(red_angle, yellow_span, self.cfg.SYSTEM_DELAY_MS)
 
                 if is_hit:
@@ -763,7 +833,7 @@ class App:
                     print(">>> 触发按键: Space <<<")
 
                 # 渲染预览
-                self._show_live_preview(frame, red_angle, self.tracker.locked_yellow_span, self.tracker.status_msg, is_hit, elapsed, cap_elapsed)
+                self._show_live_preview(frame, red_angle, self.tracker.locked_yellow_span, self.tracker.status_msg, is_hit, elapsed, cap_elapsed, debug_red_mask)
                 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
