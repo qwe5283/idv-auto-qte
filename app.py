@@ -69,9 +69,10 @@ class Config:
     END_ANGLE: int = 340
     
     # 追踪器参数
-    SYSTEM_DELAY_MS: float = 10.0          # 延迟补偿时间（结合云游戏延迟换算），提前触发
+    SYSTEM_DELAY_MS: float = 10.0         # 延迟补偿时间（结合云游戏延迟换算），提前触发
     COOLDOWN_SEC: float = 1.5             # QTE击打触发后的冷却时间（秒）
-    HISTORY_LENGTH: int = 8
+    HISTORY_LENGTH: int = 8               # 用于计算红色指针运动趋势的历史记录长度（帧数），仅用于计算红色指针角速度
+    # （游戏中的红色指针的速度通常在120度/秒左右）
     MIN_ANGULAR_SPEED_DPS: float = 60.0   # 红色指针的最小角速度阈值（度/秒），转动过慢将被忽略
     # （新出现的红色指针应位于圆弧左侧，角度小于此阈值才视为合法QTE指针，排除场景红色物体误判）
     NEW_RED_MAX_ANGLE: float = 215.0      # 红色指针首次出现时的最大允许角度（度）
@@ -316,16 +317,20 @@ class QTEDetector:
         """计算红色指针的任意角范围角度"""
         contours, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         valid_points = []
-        inner_r, outer_r = self.radius - self.thickness * 1.2, self.radius + self.thickness * 1.2
+        # 向内拓展检测区域
+        outer_r = self.radius
+        inner_r = self.radius - self.thickness * 3
         # 中心坐标需要减去 ROI 的偏移量，转换为局部坐标系
         local_center = (self.arc_center[0] - rx, self.arc_center[1] - ry)
 
         for cnt in contours:
-            if cv2.contourArea(cnt) > self.min_red_area:
+            if cv2.contourArea(cnt) > self.min_red_area: # 过滤掉小面积噪点
                 points = cnt.reshape(-1, 2)
+                # 转化为以指针中心为原点的向量并计算向量模长
                 dx = points[:, 0] - local_center[0]
                 dy = points[:, 1] - local_center[1]
                 dist = np.sqrt(dx**2 + dy**2)
+                # 过滤掉拓展检测区域但不在ROI圆弧范围内的点
                 mask_dist = (dist >= inner_r) & (dist <= outer_r)
                 if np.any(mask_dist):
                     valid_points.append(points[mask_dist])
