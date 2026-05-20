@@ -71,7 +71,7 @@ class Config:
     
     # 追踪器参数
     # （游戏帧率上限为60FPS，考虑游戏引擎输入队列轮询延迟）
-    SYSTEM_DELAY_MS: float = 20.0         # 延迟补偿时间（结合云游戏延迟换算），提前触发
+    SYSTEM_DELAY_MS: float = 30.0         # 延迟补偿时间（结合云游戏延迟换算），提前触发
     COOLDOWN_SEC: float = 1.5             # QTE击打触发后的冷却时间（秒）
     RED_TIME_WINDOW_SEC: float = 0.4      # 红色指针运动趋势的采样时间窗口（秒），仅用于维护计算红色指针角速度所用队列
     # （游戏中的红色指针的速度通常在120度/秒左右）
@@ -528,37 +528,41 @@ class QTETracker:
             return False
 
         # 基于到达时间的预判
-        target_angle = self.locked_yellow_span[0]
-        # 延迟补偿 (self.angular_speed 已经是 度/秒)
-        delay_compensation_angle = self.angular_speed * (delay_ms / 1000.0)
-        # 拿到延迟补偿后当前指针所指角度
-        current_projected_angle = red_front_angle + delay_compensation_angle
+        target_angle = self.locked_yellow_span[0] # 目标起始角度
+
+        # 计算理论到达时间
+        time_to_target = (target_angle - self.red_angle_history[-1][0]) / self.angular_speed
+        time_to_trigger = time_to_target - (delay_ms / 1000.0)
         
-        if current_projected_angle >= target_angle: # 判定指针已经到达目标
+        if time_to_trigger <= 0: # 已经过了理论触发时刻，立即触发
             self.triggered = True
             self.last_trigger_time = current_time
             self.status_msg = ">>> HIT! SPACE <<<"
             self.red_angle_history.clear()
             self.locked_yellow_span = None
-            print(f"[DEBUG] Red Angular Speed: {self.angular_speed:.1f} deg/s")
             return True
             
         self.status_msg = f"Approaching... R:{red_front_angle:.1f} T:{target_angle:.1f}"
         return False
 
     def _check_red_moving_right(self, current_time: float) -> bool:
-        """检测红色指针是否正在向右顺时针旋转"""
+        """检测红色指针是否正在向右顺时针旋转，使用最小二乘法线性回归计算角速度，防止异步采样产生相位差"""
         # 清理超过时间窗口的红色历史记录
         while self.red_angle_history and current_time - self.red_angle_history[0][1] > self.cfg.RED_TIME_WINDOW_SEC:
             self.red_angle_history.popleft()
         if len(self.red_angle_history) < 5:
-            return False # 至少5个采样点再开始计算速度
-        
-        delta_angle = self.red_angle_history[-1][0] - self.red_angle_history[0][0]
-        delta_time = self.red_angle_history[-1][1] - self.red_angle_history[0][1]
-        if delta_time < 1e-6:
-            return False # 避免除以零
-        speed = delta_angle / delta_time
+            return False # 至少5个采样点再开始回归
+        # 提取时间和角度
+        times = np.array([t for _, t in self.red_angle_history])
+        angles = np.array([a for a, _ in self.red_angle_history])
+        # 相对时间，避免浮点数精度问题
+        times_rel = times - times[0]
+        # 最小二乘法线性回归: angle = speed * time + offset
+        # 使用 np.polyfit 进行一阶多项式拟合
+        try:
+            speed, _ = np.polyfit(times_rel, angles, 1)
+        except np.linalg.LinAlgError:
+            return False
 
         if speed > self.cfg.MIN_ANGULAR_SPEED_DPS:
             self.angular_speed = speed
