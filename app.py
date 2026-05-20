@@ -11,6 +11,7 @@ import ctypes
 import mss
 import pydirectinput
 import psutil
+import pywintypes
 from dataclasses import dataclass, field
 from collections import deque
 from typing import Optional, Tuple
@@ -109,7 +110,6 @@ class WindowManager:
     @staticmethod
     def get_top_level_hwnd(hwnd: int) -> int:
         """获取指定窗口的顶层父窗口"""
-        if not win32gui.IsWindow(hwnd): return 0
         while True:
             parent = win32gui.GetParent(hwnd)
             if not parent:
@@ -607,7 +607,7 @@ class App:
             fps = 1.0 / max(elapsed, 1e-6)
             cap_elapsed_ms = cap_elapsed * 1000
             fps_text = f"FPS: {fps:.2f} | MSS: {cap_elapsed_ms:.2f}ms"
-            cv2.putText(vis_frame, fps_text, (20, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(vis_frame, fps_text, (20, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         window_name = "Identity V QTE Auto-Handler"
         if self.cfg.PREVIEW_WINDOW_TOP_MOST:
@@ -769,6 +769,9 @@ class App:
                     
         except KeyboardInterrupt:
             print("[*] 收到 Ctrl+C，程序正在退出...")
+        except pywintypes.error as e:
+            if e.args[0] == 1400:  # 1400 对应 "无效的窗口句柄"
+                print("[X] 错误：窗口句柄无效，可能是窗口已关闭。")
         finally:
             self.sct.close()
             cv2.destroyAllWindows()
