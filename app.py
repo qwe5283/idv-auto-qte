@@ -71,7 +71,7 @@ class Config:
     
     # 追踪器参数
     # （游戏帧率上限为60FPS，考虑游戏引擎输入队列轮询延迟）
-    SYSTEM_DELAY_MS: float = 15.0         # 延迟补偿时间（结合云游戏延迟换算），提前触发
+    SYSTEM_DELAY_MS: float = 20.0         # 延迟补偿时间（结合云游戏延迟换算），提前触发
     COOLDOWN_SEC: float = 1.5             # QTE击打触发后的冷却时间（秒）
     RED_TIME_WINDOW_SEC: float = 0.4      # 红色指针运动趋势的采样时间窗口（秒），仅用于维护计算红色指针角速度所用队列
     # （游戏中的红色指针的速度通常在120度/秒左右）
@@ -554,21 +554,14 @@ class QTETracker:
         if len(self.red_angle_history) < 5:
             return False # 至少5个采样点再开始计算速度
         
-        speeds = []
-        for i in range(1, len(self.red_angle_history)):
-            prev_angle, prev_time = self.red_angle_history[i-1]
-            curr_angle, curr_time = self.red_angle_history[i]
-            delta_time = curr_time - prev_time
-            delta_angle = curr_angle - prev_angle
-            if delta_angle <= 0:
-                continue # 只考虑顺时针旋转的样本，过滤掉但渲染帧重复采样造成不动的情况
-            speeds.append(delta_angle / delta_time) # 计算每个连续样本的瞬时角速度
-        if not speeds:  
-            return False  # 时间窗口内没有足够有效的跨帧样本计算速度
-        # 计算瞬时速度的中位数，防止异常值或重复采样造成的速度毛刺干扰
-        median_speed = float(np.median(speeds))
-        if median_speed > self.cfg.MIN_ANGULAR_SPEED_DPS:
-            self.angular_speed = median_speed
+        delta_angle = self.red_angle_history[-1][0] - self.red_angle_history[0][0]
+        delta_time = self.red_angle_history[-1][1] - self.red_angle_history[0][1]
+        if delta_time < 1e-6:
+            return False # 避免除以零
+        speed = delta_angle / delta_time
+
+        if speed > self.cfg.MIN_ANGULAR_SPEED_DPS:
+            self.angular_speed = speed
             return True
         return False
     
