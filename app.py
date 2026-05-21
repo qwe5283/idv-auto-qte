@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 import math
 import time
+import datetime
 import sys
 import ctypes
 import mss
@@ -486,7 +487,7 @@ class QTETracker:
         self.locked_yellow_span = None
         self.status_msg = "Waiting"
 
-    def update_and_check(self, red_front_angle: Optional[float], yellow_span: Optional[Tuple[float, float]], delay_ms: float = 0.0) -> bool:
+    def update_and_check(self, red_front_angle: Optional[float], yellow_span: Optional[Tuple[float, float]], system_delay_ms: float = 0.0, process_delay_sec: float = 0.0) -> bool:
         """返回是否应该触发按键"""
         current_time = time.perf_counter()
 
@@ -532,7 +533,8 @@ class QTETracker:
 
         # 计算理论到达时间
         time_to_target = (target_angle - self.red_angle_history[-1][0]) / self.angular_speed
-        time_to_trigger = time_to_target - (delay_ms / 1000.0)
+        time_to_trigger = time_to_target - (system_delay_ms / 1000.0) # 静态系统延迟补偿
+        time_to_trigger -= process_delay_sec # 脚本主循环的动态处理延迟补偿，用于近似代替当前帧处理延迟
         
         if time_to_trigger <= 0: # 已经过了理论触发时刻，立即触发
             self.triggered = True
@@ -627,6 +629,7 @@ class App:
         self.tracker = None
         self.current_size = None # 记录上一次的窗口客户区尺寸
         self.last_frame_time = time.perf_counter()
+        self.frame_times = deque()  # 近半秒帧耗时记录 (elapsed_sec, timestamp)
 
     def _handle_aspect_ratio_check(self, w: int, h: int):
         """处理比例检查与用户交互"""
@@ -663,7 +666,7 @@ class App:
                            yellow_span: Optional[Tuple[float, float]], 
                            status_msg: str, 
                            is_hit: bool, 
-                           elapsed: float, 
+                           avg_fps: float, 
                            cap_elapsed: float,
                            debug_red_mask=None):
         """实时屏幕捕获模式的独立预览渲染逻辑"""
@@ -671,18 +674,17 @@ class App:
 
         vis_frame = self.detector.render_debug(frame, red_angle, yellow_span, status_msg, is_hit, debug_red_mask, True)
         
-        # 计算FPS显示
-        if elapsed:
-            fps = 1.0 / max(elapsed, 1e-6)
+        # 显示平均FPS
+        if avg_fps > 0:
             cap_elapsed_ms = cap_elapsed * 1000
-            fps_text = f"FPS: {fps:.2f} | MSS: {cap_elapsed_ms:.2f}ms"
+            fps_text = f"FPS: {avg_fps:.1f} | MSS: {cap_elapsed_ms:.1f}ms"
             cv2.putText(vis_frame, fps_text, (20, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         window_name = "Identity V QTE Auto-Handler"
         if self.cfg.PREVIEW_WINDOW_TOP_MOST:
             cv2.namedWindow(window_name)
             cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
-        show_frame = cv2.resize(vis_frame, (530, 192))
+        show_frame = cv2.resize(vis_frame, (442, 160))
         cv2.imshow(window_name, show_frame)
 
     def _show_video_preview(self, 
@@ -691,18 +693,16 @@ class App:
                             yellow_span: Optional[Tuple[float, float]], 
                             status_msg: str, 
                             is_hit: bool, 
-                            elapsed: float,
+                            avg_fps: float,
                             debug_red_mask=None):
         """视频分析模式的独立预览渲染逻辑"""
         assert self.detector is not None
 
         vis_frame = self.detector.render_debug(frame, red_angle, yellow_span, status_msg, is_hit, debug_red_mask, False)
         
-        # 计算FPS显示
-        if elapsed:
-            fps = 1.0 / max(elapsed, 1e-6)
-            elapsed_ms = elapsed * 1000
-            fps_text = f"FPS: {fps:.2f} | Elapsed: {elapsed_ms:.2f}ms"
+        # 显示平均FPS
+        if avg_fps > 0:
+            fps_text = f"FPS: {avg_fps:.1f}"
             cv2.putText(vis_frame, fps_text, (30, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
         
         # 视频预览窗口不设置过大，避免占满屏幕
@@ -722,6 +722,8 @@ class App:
             h, w = frame.shape[:2]
             self._init_components(w, h)
             print("[*] QTE 视频分析已启动")
+            self.frame_times.clear()
+            self.last_frame_time = time.perf_counter()
 
             assert self.detector is not None
 
@@ -730,6 +732,14 @@ class App:
                 current_time = time.perf_counter()
                 elapsed = current_time - self.last_frame_time
                 self.last_frame_time = current_time
+
+                # 维护近半秒帧耗时窗口并计算平均FPS
+                if elapsed > 1e-4:
+                    self.frame_times.append((elapsed, current_time))
+                while self.frame_times and current_time - self.frame_times[0][1] > 0.5:
+                    self.frame_times.popleft()
+                total_elapsed = sum(e for e, _ in self.frame_times)
+                avg_fps = len(self.frame_times) / max(total_elapsed, 1e-6) if self.frame_times else 0.0
                 
                 # 读取视频帧
                 ret, frame = cap.read()
@@ -741,7 +751,7 @@ class App:
                 is_hit = self.tracker.update_and_check(red_angle, yellow_span)
 
                 # 渲染可视化
-                self._show_video_preview(frame, red_angle, self.tracker.locked_yellow_span, self.tracker.status_msg, is_hit, elapsed, debug_red_mask)
+                self._show_video_preview(frame, red_angle, self.tracker.locked_yellow_span, self.tracker.status_msg, is_hit, avg_fps, debug_red_mask)
 
                 if is_hit:
                     print(">>> 触发按键: Space <<<")
@@ -749,6 +759,7 @@ class App:
                     self.tracker.last_trigger_time += self.cfg.PREVIEW_VIDEO_HIT_TIME_SEC
                     if cv2.waitKey(int(self.cfg.PREVIEW_VIDEO_HIT_TIME_SEC * 1000)) & 0xFF == ord('q'): 
                         break
+                    self.last_frame_time = time.perf_counter()
                 elif cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
@@ -792,12 +803,21 @@ class App:
                 elapsed = current_time - self.last_frame_time
                 self.last_frame_time = current_time
 
+                # 维护近半秒帧耗时窗口并计算平均FPS
+                if elapsed > 1e-4:
+                    self.frame_times.append((elapsed, current_time))
+                while self.frame_times and current_time - self.frame_times[0][1] > 0.5:
+                    self.frame_times.popleft()
+                total_elapsed = sum(e for e, _ in self.frame_times)
+                avg_fps = len(self.frame_times) / max(total_elapsed, 1e-6) if self.frame_times else 0.0
+
                 # 每次循环确认焦点是否还在游戏上，避免切屏误触
                 fg_hwnd = win32gui.GetForegroundWindow()
                 is_focused = (fg_hwnd == self.hwnd) or (self.win_mgr.get_top_level_hwnd(self.hwnd) == fg_hwnd)
                 if not is_focused:
                     time.sleep(0.2)
                     self.last_frame_time = time.perf_counter()
+                    self.frame_times.clear()
                     continue
                 
                 # 动态获取当前帧的客户区尺寸
@@ -831,14 +851,15 @@ class App:
                 
                 # 检测与追踪
                 red_angle, yellow_span, debug_red_mask = self.detector.process_frame(frame, True)
-                is_hit = self.tracker.update_and_check(red_angle, yellow_span, self.cfg.SYSTEM_DELAY_MS)
+                process_delay_sec = sum(e for e, _ in self.frame_times) / len(self.frame_times) if self.frame_times else 0.0
+                is_hit = self.tracker.update_and_check(red_angle, yellow_span, self.cfg.SYSTEM_DELAY_MS, process_delay_sec)
 
                 if is_hit:
                     self.input_ctrl.press_space()
                     print(">>> 触发按键: Space <<<")
 
                 # 渲染预览
-                self._show_live_preview(frame, red_angle, self.tracker.locked_yellow_span, self.tracker.status_msg, is_hit, elapsed, cap_elapsed, debug_red_mask)
+                self._show_live_preview(frame, red_angle, self.tracker.locked_yellow_span, self.tracker.status_msg, is_hit, avg_fps, cap_elapsed, debug_red_mask)
                 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
