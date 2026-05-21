@@ -6,7 +6,6 @@ import cv2
 import numpy as np
 import math
 import time
-import datetime
 import sys
 import ctypes
 import mss
@@ -72,7 +71,7 @@ class Config:
     
     # 追踪器参数
     # （游戏帧率上限为60FPS，考虑游戏引擎输入队列轮询延迟）
-    SYSTEM_DELAY_MS: float = 30.0         # 延迟补偿时间（结合云游戏延迟换算），提前触发
+    SYSTEM_DELAY_MS: float = 25.0         # 延迟补偿时间（结合云游戏延迟换算），提前触发
     COOLDOWN_SEC: float = 1.5             # QTE击打触发后的冷却时间（秒）
     RED_TIME_WINDOW_SEC: float = 0.4      # 红色指针运动趋势的采样时间窗口（秒），仅用于维护计算红色指针角速度所用队列
     # （游戏中的红色指针的速度通常在120度/秒左右）
@@ -535,7 +534,7 @@ class QTETracker:
         time_to_target = (target_angle - self.red_angle_history[-1][0]) / self.angular_speed
         time_to_trigger = time_to_target - (system_delay_ms / 1000.0) # 静态系统延迟补偿
         time_to_trigger -= process_delay_sec # 脚本主循环的动态处理延迟补偿，用于近似代替当前帧处理延迟
-        
+
         if time_to_trigger <= 0: # 已经过了理论触发时刻，立即触发
             self.triggered = True
             self.last_trigger_time = current_time
