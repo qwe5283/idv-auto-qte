@@ -14,7 +14,7 @@ import psutil
 import pywintypes
 from dataclasses import dataclass, field
 from collections import deque
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 from ctypes import wintypes
 
 # 尝试导入 win32gui，若失败则提示
@@ -69,9 +69,11 @@ class Config:
     START_ANGLE: int = 200
     END_ANGLE: int = 340
     
-    # 追踪器参数
+    # 延迟补偿参数
     # （游戏帧率上限为60FPS，考虑游戏引擎输入队列轮询延迟）
-    SYSTEM_DELAY_MS: float = 25.0         # 延迟补偿时间（结合云游戏延迟换算），提前触发
+    CLIENT_DELAY_MS: float = 0.0          # 客户端延迟补偿时间，提前触发
+    EMULATOR_DELAY_MS: float = 25.0       # 模拟器延迟补偿时间（ms），提前触发。MuMu模拟器的画面渲染与脚本采样异步性产生时间混叠导致的额外延迟，需通过实测调整
+    # 追踪器参数
     COOLDOWN_SEC: float = 1.5             # QTE击打触发后的冷却时间（秒）
     RED_TIME_WINDOW_SEC: float = 0.4      # 红色指针运动趋势的采样时间窗口（秒），仅用于维护计算红色指针角速度所用队列
     # （游戏中的红色指针的速度通常在120度/秒左右）
@@ -176,7 +178,7 @@ class WindowManager:
         win32gui.EnumWindows(callback, hwnds)
         return hwnds[0] if hwnds else None
 
-    def wait_for_focus(self, process_name: str) -> Tuple[int, str]:
+    def wait_for_focus(self, process_name: str) -> Tuple[int, Literal["CLIENT", "EMULATOR"]]:
         """同步阻塞，等待游戏客户端或 MuMu 模拟器成为焦点窗口，返回(顶层窗口句柄, 客户端类型)"""
         print(f"[*] 等待进程 [{process_name}] 或 [MuMu模拟器] 启动并获取焦点...")
         while True:
@@ -486,7 +488,7 @@ class QTETracker:
         self.locked_yellow_span = None
         self.status_msg = "Waiting"
 
-    def update_and_check(self, red_front_angle: Optional[float], yellow_span: Optional[Tuple[float, float]], system_delay_ms: float = 0.0, process_delay_sec: float = 0.0) -> bool:
+    def update_and_check(self, red_front_angle: Optional[float], yellow_span: Optional[Tuple[float, float]], delay_sec: float = 0.0) -> bool:
         """返回是否应该触发按键"""
         current_time = time.perf_counter()
 
@@ -527,13 +529,12 @@ class QTETracker:
         if self.locked_yellow_span is None:
             return False
 
-        # 基于到达时间的预判
-        target_angle = self.locked_yellow_span[0] # 目标起始角度
+        # 基于到达时间的预判（击打1/3处）
+        target_angle = self.locked_yellow_span[0] + (self.locked_yellow_span[1] - self.locked_yellow_span[0]) / 3
 
         # 计算理论到达时间
-        time_to_target = (target_angle - self.red_angle_history[-1][0]) / self.angular_speed
-        time_to_trigger = time_to_target - (system_delay_ms / 1000.0) # 静态系统延迟补偿
-        time_to_trigger -= process_delay_sec # 脚本主循环的动态处理延迟补偿，用于近似代替当前帧处理延迟
+        time_to_target = (target_angle - self.red_angle_history[-1][0]) / self.angular_speed # 以当前角速度预估到达目标角度的时间
+        time_to_trigger = time_to_target - delay_sec # 延迟补偿
 
         if time_to_trigger <= 0: # 已经过了理论触发时刻，立即触发
             self.triggered = True
@@ -848,10 +849,15 @@ class App:
                 # 截图+转码耗时
                 cap_elapsed = time.perf_counter() - start_time
                 
+                # 计算延迟
+                process_delay_sec = sum(e for e, _ in self.frame_times) / len(self.frame_times) if self.frame_times else 0.0 # 近似代替当前帧处理延迟的动态补偿值
+                if client_type == "CLIENT":
+                    total_delay_sec = self.cfg.CLIENT_DELAY_MS / 1000.0 + process_delay_sec
+                elif client_type == "EMULATOR":
+                    total_delay_sec = self.cfg.EMULATOR_DELAY_MS / 1000.0 + process_delay_sec
                 # 检测与追踪
                 red_angle, yellow_span, debug_red_mask = self.detector.process_frame(frame, True)
-                process_delay_sec = sum(e for e, _ in self.frame_times) / len(self.frame_times) if self.frame_times else 0.0
-                is_hit = self.tracker.update_and_check(red_angle, yellow_span, self.cfg.SYSTEM_DELAY_MS, process_delay_sec)
+                is_hit = self.tracker.update_and_check(red_angle, yellow_span, total_delay_sec)
 
                 if is_hit:
                     self.input_ctrl.press_space()
