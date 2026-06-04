@@ -515,8 +515,10 @@ class QTETracker:
             self.status_msg = "Red Not On Left Side"
             return False
 
+        # 丢弃重复帧，只有当红色指针的前沿角度发生大于0.1度的变化时才记录到历史中，防止异步采样导致的相位差引起的误判
+        if (not self.red_angle_history) or (abs(red_front_angle - self.red_angle_history[-1][0]) > 0.1):
+            self.red_angle_history.append((red_front_angle, current_time))
         # 检测红色指针是否停止转动
-        self.red_angle_history.append((red_front_angle, current_time))
         if not self._check_red_moving_right(current_time):
             self.status_msg = "Red Not Moving/Too Slow"
             return False
