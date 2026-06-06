@@ -32,7 +32,7 @@ class Config:
     START_ANGLE: int = 200
     END_ANGLE: int = 340
     
-    # HSV 范围 (原样保留)
+    # HSV 范围
     RED_L1: np.ndarray = field(default_factory=lambda: np.array([0, 157, 90], dtype=np.uint8))
     RED_U1: np.ndarray = field(default_factory=lambda: np.array([8, 255, 255], dtype=np.uint8))
     RED_L2: np.ndarray = field(default_factory=lambda: np.array([175, 157, 90], dtype=np.uint8))
@@ -45,12 +45,12 @@ class Config:
     COOLDOWN: float = 1.5           # 击打冷却 (秒)
     NEW_RED_MAX_ANGLE: float = 215.0# 首次出现最大角度 (防红衣误判)
     MIN_SPEED: float = 60.0         # 最小角速度 (度/秒)
-    RED_WINDOW: float = 0.4         # 速度计算时间窗口 (秒)
+    RED_WINDOW: float = 0.3         # 速度计算时间窗口 (秒)
     
     MIN_Y_SPAN: float = 4.0         # 黄色最小跨度 (度)
     MAX_Y_SPAN: float = 10.0        # 黄色最大跨度 (度)
-    Y_LAG: float = 0.4              # 黄色锁存滞后时间 (秒)
-    Y_TOL: float = 0.5              # 黄色稳定容差 (度，1D信号下建议稍微放宽至0.5)
+    Y_LAG: float = 0.3              # 黄色锁存滞后时间 (秒)
+    Y_TOL: float = 0.5              # 黄色稳定容差 (度)
     
     DELAY_COMP: float = 0.025       # 延迟补偿 (秒)
 
@@ -134,27 +134,29 @@ class QTEDetector:
         polar_y = cv2.warpPolar(mask_y, (self.polar_width, self.polar_height), self.local_center, self.radius, flags)
         
         # 4. 1D 投影降维 (仅取圆环部分，排除圆心噪点)
-        inner_r = max(0, self.radius - self.thickness - 5)
-        # X轴是半径，Y轴是角度。
-        # 切片 X轴 (半径) 从 inner_r 到 self.radius，保留所有 Y轴 (角度)。
-        # 沿着 X轴 (axis=1) 求和，得到每个角度的信号强度 (1D Array length = 720)
-        profile_r = np.sum(polar_r[:, inner_r:self.radius], axis=1)
-        profile_y = np.sum(polar_y[:, inner_r:self.radius], axis=1)
+        # 黄色区域仅在圆弧线条上，向内拓展 5 像素容差 (窄带积分)
+        inner_r_y = max(0, self.radius - self.thickness - 5)
+        # 红色指针向内延伸，拓展 4 倍厚度 (宽带积分，捕获完整指针)
+        inner_r_r = max(0, self.radius - (self.thickness * 4))
+        
+        # 分别沿 X轴 (半径) 求和，得到每个角度的信号强度 (1D Array length = 720)
+        profile_r = np.sum(polar_r[:, inner_r_r:self.radius], axis=1)
+        profile_y = np.sum(polar_y[:, inner_r_y:self.radius], axis=1)
         
         # 屏蔽无效角度
         profile_r[~self.valid_mask] = 0
         profile_y[~self.valid_mask] = 0
         
         # 5. 特征提取
-        red_angle = self._get_red(profile_r, inner_r)
-        yellow_span = self._get_yellow(profile_y, inner_r)
+        red_angle = self._get_red(profile_r, inner_r_r)
+        yellow_span = self._get_yellow(profile_y, inner_r_y)
         
         return DetectorResult(red_angle, yellow_span, polar_orig, polar_r, polar_y, profile_r, profile_y)
 
     def _get_red(self, profile: np.ndarray, inner_r: int) -> Optional[float]:
         radial_thick = self.radius - inner_r
-        # 要求指针在至少 30% 的径向厚度上贯穿 (天然抗断裂)
-        threshold = radial_thick * 255 * 0.3 
+        # 要求指针在至少 80% 的宽带厚度上贯穿 (天然抗断裂)
+        threshold = radial_thick * 255 * 0.8
         valid_idx = np.where(profile > threshold)[0]
         if len(valid_idx) == 0: return None
         
@@ -206,9 +208,11 @@ class QTETracker:
         if not self.red_history and red_angle >= self.cfg.NEW_RED_MAX_ANGLE:
             return None, "Red Not Left"
 
+        # 只有当角度变化超过 0.1 度时才记录，避免输入重复帧数据
         if not self.red_history or abs(red_angle - self.red_history[-1][0]) > 0.1:
             self.red_history.append((red_angle, current_time))
             
+        # 移除过旧的历史数据，保持在 RED_WINDOW 时间窗口内
         while self.red_history and current_time - self.red_history[0][1] > self.cfg.RED_WINDOW:
             self.red_history.popleft()
             
@@ -216,6 +220,7 @@ class QTETracker:
             times = np.array([t for _, t in self.red_history])
             angles = np.array([a for a, _ in self.red_history])
             try:
+                # 最小二乘法线性拟合计算角速度 (degree/sec)
                 speed, _ = np.polyfit(times - times[0], angles, 1)
                 if speed < self.cfg.MIN_SPEED: return None, "Too Slow"
                 self.angular_speed = speed
@@ -225,6 +230,7 @@ class QTETracker:
 
         if yellow_span:
             self.yellow_history.append((yellow_span, current_time))
+            # 判断黄色角度稳定、范围合理（过滤噪点和干扰项）
             if len(self.yellow_history) >= 2:
                 starts = [s[0][0] for s in self.yellow_history]
                 ends = [s[0][1] for s in self.yellow_history]
@@ -233,6 +239,7 @@ class QTETracker:
                     if self.cfg.MIN_Y_SPAN <= span_w <= self.cfg.MAX_Y_SPAN:
                         self.locked_y = yellow_span
         else:
+            # 没有检测到黄色时，如果之前锁定了黄色但已经过了滞后时间，则解锁
             if self.locked_y and (not self.yellow_history or current_time - self.yellow_history[-1][1] > self.cfg.Y_LAG):
                 self.locked_y = None
                 
@@ -241,7 +248,7 @@ class QTETracker:
 
         if not self.locked_y: return None, "No Yellow"
 
-        target_angle = self.locked_y[0] + (self.locked_y[1] - self.locked_y[0]) / 3.0
+        target_angle = self.locked_y[0] + (self.locked_y[1] - self.locked_y[0]) / 3.0 # 击打1/3处
         time_to_target = (target_angle - red_angle) / self.angular_speed
         hit_time = current_time + time_to_target - self.cfg.DELAY_COMP
         
@@ -322,12 +329,17 @@ def processor_thread(frame_queue: queue.Queue, action_queue: queue.Queue, render
             
         # 模拟低帧率/高负载下的处理耗时 (验证算法鲁棒性)
         if simulate_lag:
-            time.sleep(random.uniform(0.015, 0.045)) 
+            time.sleep(random.uniform(0.001, 0.02)) 
 
 def executor_thread(action_queue: queue.Queue, stop_event: threading.Event):
+    last_loop_time = 0.0
     while not stop_event.is_set():
         try:
-            hit_time, v_time, r_time = action_queue.get(timeout=0.1)
+            loop_elapsed = time.perf_counter() - last_loop_time
+            # print(f"[Executor] Loop Elapsed: {loop_elapsed*1000:.1f}ms")
+            last_loop_time = time.perf_counter()
+
+            hit_time, v_time, r_time = action_queue.get(block=False)
             delay = hit_time - time.perf_counter()
             if delay > 0: time.sleep(delay)
             
@@ -419,9 +431,11 @@ if __name__ == "__main__":
             vis_polar_t = vis_polar.transpose(1, 0, 2)
             vis_polar_resized = cv2.resize(vis_polar_t, (960, 340), interpolation=cv2.INTER_NEAREST)
 
-            # inner_r 在 Y轴 (半径) 上的位置
-            y_line = int((cfg.RADIUS - cfg.THICKNESS - 5) * (340 / w_p))
-            cv2.line(vis_polar_resized, (0, y_line), (960, y_line), (255, 255, 255), 1) # 标记 inner_r
+            # 标记各自的径向积分下界 (Y轴代表半径，0=圆心，w_p=边缘)
+            y_line_y = int((cfg.RADIUS - cfg.THICKNESS - 5) * (340 / w_p))
+            y_line_r = int(max(0, cfg.RADIUS - cfg.THICKNESS * 4) * (340 / w_p))
+            cv2.line(vis_polar_resized, (0, y_line_y), (960, y_line_y), (0, 255, 255), 1) # 黄色积分下界 (黄线)
+            cv2.line(vis_polar_resized, (0, y_line_r), (960, y_line_r), (0, 0, 255), 1)   # 红色积分下界 (红线)
             
             # 3. 绘制 1D 投影曲线
             plot_h, plot_w = 200, 960
