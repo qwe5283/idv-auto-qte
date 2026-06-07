@@ -49,8 +49,12 @@ class Config:
     
     MIN_Y_SPAN: float = 4.0         # 黄色最小跨度 (度)
     MAX_Y_SPAN: float = 10.0        # 黄色最大跨度 (度)
-    Y_LAG: float = 0.3              # 黄色锁存滞后时间 (秒)
+    # 游戏中的指针角速度约为120deg/s，确定黄色目标击打区域需要Y_LAG=0.2s意味着会错过前24度的QTE，但QTE一般不会出现在这种位置
+    Y_LAG: float = 0.2              # 黄色锁存滞后时间 (秒)
     Y_TOL: float = 0.5              # 黄色稳定容差 (度)
+
+    HIT_TIME_WINDOW: float = 0.3    # 预测击打时间收敛所需的时间窗口，窗口内未拿到稳定值将直接压入击打队列执行补救击打
+    HIT_TIME_TOL: float = 0.015     # 预测击打时间收敛容差 (15ms)，小于此值视为稳定，提前压入击打队列让执行线程精准等待
     
     DELAY_COMP: float = 0.025       # 延迟补偿 (秒)
 
@@ -188,10 +192,11 @@ class QTEDetector:
 class QTETracker:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.red_history = deque() # (angle, real_time)
-        self.yellow_history = deque() # (span, real_time)
+        self.red_history = deque(maxlen=150) # (angle, real_time)
+        self.yellow_history = deque(maxlen=150) # (span, real_time)
         self.locked_y = None
         self.angular_speed = 0.0
+        self.hit_time_history = deque(maxlen=150) # (add_time, target_hit_time)
         self.last_hit_time = -999.0
 
     def update(self, red_angle: Optional[float], yellow_span: Optional[Tuple[float, float]], current_time: float) -> Tuple[Optional[float], str]:
@@ -252,11 +257,31 @@ class QTETracker:
         time_to_target = (target_angle - red_angle) / self.angular_speed
         hit_time = current_time + time_to_target - self.cfg.DELAY_COMP
         
-        if hit_time <= current_time:
-            self.last_hit_time = current_time
-            return hit_time, "HIT"
+        # 预测时间收敛与锁存
+        if hit_time > current_time: # 还在逼近
+            self.hit_time_history.append((current_time, hit_time))
+            while self.hit_time_history and current_time - self.hit_time_history[0][0] > self.cfg.HIT_TIME_WINDOW:
+                self.hit_time_history.popleft()
+
+            # print(f"[debug] list: {str(self.hit_time_history)}")
+            print(f"[debug] 采样时间跨度：{self.hit_time_history[-1][0] - self.hit_time_history[0][0]} 采样数量：{len(self.hit_time_history)}")
+
+            if self.hit_time_history[-1][0] - self.hit_time_history[0][0] > self.cfg.HIT_TIME_WINDOW * 0.5: # 至少需要半个窗口的历史数据来判断趋势
+                times = [t for _, t in self.hit_time_history]
+                print(f"[debug] 极差: {max(times) - min(times):.4f} 秒")
+                # 检查最近 N 帧的预测时间是否收敛 (极差小于容差)
+                if max(times) - min(times) <= self.cfg.HIT_TIME_TOL:
+                    # 收敛！锁定最终击打时间(平均值)，让处理线程提前将时间压入击打队列，让执行线程去精准等待
+                    final_hit_time = sum(times) / len(times)
+                    self.last_hit_time = current_time # 提前进入冷却，防止重复入队
+                    return final_hit_time, "HIT"
             
-        return hit_time, f"Approach R:{red_angle:.1f} T:{target_angle:.1f}"
+            return hit_time, f"Approach R:{red_angle:.1f} T:{target_angle:.1f}"
+            
+        else: # 已经过了预测时间（可能是突然出现的QTE或者严重丢帧导致的紧急补刀）
+            self.last_hit_time = current_time
+            print(f"[{current_time:.3f}s] 预测时间已过，立即执行补刀！")
+            return hit_time, "HIT"
 
 # ==========================================
 # 5. 多线程定义
@@ -312,7 +337,7 @@ def processor_thread(frame_queue: queue.Queue, action_queue: queue.Queue, render
         
         if status == "HIT":
             action_queue.put((hit_time, v_time, r_time))
-            print(f"[{v_time:7.3f}s] 🎯 PREDICTED HIT (Status: {status})")
+            print(f"[{time.perf_counter():7.3f}s] 🎯 QUEUED HIT: {hit_time:.3f}")
 
         debug_data = DebugData(
             frame=frame, red_angle=res.red_angle, yellow_span=res.yellow_span,
@@ -332,22 +357,20 @@ def processor_thread(frame_queue: queue.Queue, action_queue: queue.Queue, render
             time.sleep(random.uniform(0.001, 0.02)) 
 
 def executor_thread(action_queue: queue.Queue, stop_event: threading.Event):
-    last_loop_time = 0.0
     while not stop_event.is_set():
         try:
-            loop_elapsed = time.perf_counter() - last_loop_time
-            # print(f"[Executor] Loop Elapsed: {loop_elapsed*1000:.1f}ms")
-            last_loop_time = time.perf_counter()
-
-            hit_time, v_time, r_time = action_queue.get(block=False)
+            hit_time, v_time, r_time = action_queue.get() # 阻塞直到有击打任务
             delay = hit_time - time.perf_counter()
-            if delay > 0: time.sleep(delay)
+            if delay > 0: time.sleep(delay) # 精确等待直到击打时间
+            # Windows应用时钟中断频率默认64Hz，唤醒线程时间存在15.6ms延迟。在生产环境应提前16ms唤醒线程并使用自旋等待剩余时间
             
             # 计算从“看到画面”到“实际击打”的真实反应延迟
             react_ms = (time.perf_counter() - r_time) * 1000
-            print(f"[{v_time:7.3f}s] 🔥 EXECUTE SPACE! (React Delay: {react_ms:.1f}ms)")
+            print(f"[{time.perf_counter():7.3f}s] 🔥 EXECUTE HIT ACTION! (React Delay: {react_ms:.1f}ms)")
         except queue.Empty:
             continue
+        except OverflowError:
+            break
 
 # ==========================================
 # 6. 主程序 (包含可视化渲染循环)
@@ -476,6 +499,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("[*] 手动终止...")
     finally:
+        aq.put((float('inf'), 0, 0)) # 确保 Executor 线程能尽快退出阻塞状态
         stop.set()
         t1.join(); t2.join(); t3.join()
         print("[*] 分析结束。")
